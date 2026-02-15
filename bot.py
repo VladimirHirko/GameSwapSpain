@@ -27,6 +27,10 @@ ADMIN (minimal):
 
 BAN GUARD:
 - Забаненный пользователь не может использовать /add /mygames /search /catalog /profile /swap
+
+CONTACT FIX:
+- Никогда не показываем фейковый @SinUsuario как контакт.
+- Если у пользователя нет username -> даём кнопку "💬 Escribir" через tg://user?id=USER_ID
 """
 
 import os
@@ -102,24 +106,24 @@ def publish_target_chat_id() -> str | int | None:
         return v
 
 
-async def safe_publish_text(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def safe_publish_text(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
     chat_id = publish_target_chat_id()
     if not chat_id:
         logger.warning("Publish skipped: CHANNEL_CHAT_ID/GROUP_CHAT_ID not set")
         return
     try:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
     except Exception:
         logger.exception("Failed to publish text to %r", chat_id)
 
 
-async def safe_publish_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_id: str, caption: str) -> None:
+async def safe_publish_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_id: str, caption: str, reply_markup=None) -> None:
     chat_id = publish_target_chat_id()
     if not chat_id:
         logger.warning("Publish skipped: CHANNEL_CHAT_ID/GROUP_CHAT_ID not set")
         return
     try:
-        await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=caption)
+        await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=caption, reply_markup=reply_markup)
     except Exception:
         logger.exception("Failed to publish photo to %r", chat_id)
 
@@ -128,13 +132,79 @@ def fmt_game(g: dict) -> str:
     return f"{g['title']} ({g['platform']}, {g['condition']})"
 
 
-def fmt_user(u: dict) -> str:
-    username = (u.get("username") or "SinUsuario").strip()
-    if not username.startswith("@"):
-        username = "@" + username
-    return username
+# ---------- CONTACT FIX helpers ----------
+def _clean_username(username: str | None) -> str:
+    u = (username or "").strip()
+    if u.startswith("@"):
+        u = u[1:].strip()
+    return u
 
 
+def has_real_username(user_dict: dict) -> bool:
+    """
+    True только если username реально задан у пользователя Telegram и не является заглушкой.
+    """
+    u = _clean_username(user_dict.get("username"))
+    if not u:
+        return False
+    if u.lower() == "sinusuario":
+        return False
+    return True
+
+
+def fmt_user(user_dict: dict) -> str:
+    """
+    Для отображения в тексте:
+    - если есть реальный username -> @username
+    - иначе -> display_name (без @)
+    """
+    if has_real_username(user_dict):
+        u = _clean_username(user_dict.get("username"))
+        return "@" + u
+    name = (user_dict.get("display_name") or "Usuario").strip()
+    return name
+
+
+def contact_url(user_id: int) -> str:
+    return f"tg://user?id={int(user_id)}"
+
+
+def contact_button(owner: dict) -> InlineKeyboardMarkup | None:
+    """
+    Если username нет — возвращаем кнопку "Escribir" по user_id.
+    Если username есть — кнопку можно не давать (и так есть @).
+    """
+    try:
+        uid = int(owner.get("user_id") or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        return None
+
+    if has_real_username(owner):
+        return None
+
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("💬 Escribir al dueño", url=contact_url(uid))]]
+    )
+
+
+def owner_display_line(owner: dict) -> str:
+    """
+    Строка владельца без фейковых @.
+    """
+    city = (owner.get("city") or "").strip()
+    if has_real_username(owner):
+        base = f"👤 {fmt_user(owner)}"
+    else:
+        name = (owner.get("display_name") or "Usuario").strip()
+        base = f"👤 {name} (sin @username)"
+    if city:
+        return base + f" — {city}"
+    return base
+
+
+# ---------- misc helpers ----------
 def stars_label(n: int) -> str:
     n = max(1, min(5, int(n)))
     return "⭐" * n + "☆" * (5 - n)
@@ -194,7 +264,7 @@ def _admin_users_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 def _fmt_user_line(u: dict) -> str:
     ban = "🚫" if int(u.get("is_banned") or 0) == 1 else "✅"
-    username = u.get("username") or "SinUsuario"
+    username = _clean_username(u.get("username")) or "—"
     return (
         f"{ban} {u.get('user_id')}  @{username} | {u.get('display_name','')} | {u.get('city','')} | "
         f"⭐{float(u.get('rating') or 0.0):.1f} ({int(u.get('rating_count') or 0)}) | 🔄{int(u.get('total_swaps') or 0)}"
@@ -314,12 +384,13 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return REGISTRATION_CITY
 
     user_id = update.effective_user.id
-    username = update.effective_user.username or "SinUsuario"
+    # ⚠️ IMPORTANT: don't force "SinUsuario" as real username. Save empty if missing.
+    username = update.effective_user.username or ""
     display_name = context.user_data.get("display_name", "SinNombre")
 
     db.create_user(user_id, username, display_name, city)
 
-    await update.message.reply_text(
+    msg = (
         "✅ ¡Registro completado!\n\n"
         f"👤 Nombre: {display_name}\n"
         f"📍 Ciudad: {city}\n\n"
@@ -328,9 +399,17 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/search — buscar juego\n"
         "/catalog — ver todos los juegos disponibles\n"
         "/swap — confirmar intercambio\n"
-        "/help — obtener ayuda",
-        reply_markup=ReplyKeyboardRemove(),
+        "/help — obtener ayuda"
     )
+
+    # If no username, hint how to set it
+    if not (update.effective_user.username or "").strip():
+        msg += (
+            "\n\n💡 Consejo: en Telegram puedes añadir un @username (Ajustes → Nombre de usuario). "
+            "Así otros podrán encontrarte más fácil."
+        )
+
+    await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
 
     await safe_publish_text(
         context,
@@ -479,7 +558,7 @@ async def add_game_looking(update: Update, context: ContextTypes.DEFAULT_TYPE):
         looking_for=context.user_data["game_looking_for"],
     )
 
-    user = db.get_user(user_id)
+    user = db.get_user(user_id) or {"user_id": user_id, "username": "", "display_name": "Usuario", "city": ""}
 
     await update.message.reply_text(
         "✅ ¡Juego añadido al catálogo!\n\n"
@@ -491,23 +570,26 @@ async def add_game_looking(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Añadir otro → /add"
     )
 
+    owner_line = owner_display_line(user)
+    rating_line = f"⭐ Valoración: {float(user.get('rating') or 0.0):.1f} ({int(user.get('total_swaps') or 0)} intercambios)"
+
     message_text = (
         "🆕 ¡NUEVO JUEGO EN EL CATÁLOGO!\n\n"
         f"🎮 {context.user_data['game_title']}\n"
         f"📱 {context.user_data['game_platform']}\n"
         f"⭐ Estado: {context.user_data['game_condition']}\n"
         f"🔄 Busca: {context.user_data['game_looking_for']}\n\n"
-        f"👤 Propietario: @{user['username']}\n"
-        f"📍 Ciudad: {user['city']}\n"
-        f"⭐ Valoración: {float(user['rating'] or 0.0):.1f} ({int(user['total_swaps'] or 0)} intercambios)\n\n"
-        f"💬 Contactar: @{user['username']}"
+        f"{owner_line}\n"
+        f"📍 Ciudad: {user.get('city','')}\n"
+        f"{rating_line}\n"
     )
 
+    markup = contact_button(user)  # button only if no username
     photo_id = context.user_data.get("game_photo")
     if photo_id:
-        await safe_publish_photo(context, photo_file_id=photo_id, caption=message_text)
+        await safe_publish_photo(context, photo_file_id=photo_id, caption=message_text, reply_markup=markup)
     else:
-        await safe_publish_text(context, text=message_text)
+        await safe_publish_text(context, text=message_text, reply_markup=markup)
 
     return ConversationHandler.END
 
@@ -578,20 +660,29 @@ async def search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = f"🔍 RESULTADOS PARA: «{q}»\nEncontrados: {len(results)}\n\n"
 
     shown = 0
+    last_markup = None
+
     for game in results:
         if int(game["user_id"]) == int(user_id):
             continue
         owner = db.get_user(int(game["user_id"]))
         if not owner:
             continue
+
+        contact_line = f"💬 Contacto: {fmt_user(owner)}" if has_real_username(owner) else "💬 Contacto: (usa el botón «Escribir»)"
         message += (
             f"🎮 {game['title']}\n"
             f"📱 {game['platform']}  |  ⭐ {game['condition']}\n"
             f"🔄 Busca: {game['looking_for']}\n"
-            f"👤 @{owner['username']} ({owner['city']})\n"
-            f"⭐ {float(owner['rating'] or 0.0):.1f}/5.0  ({int(owner['total_swaps'] or 0)} intercambios)\n"
-            f"💬 Contacto: @{owner['username']}\n\n"
+            f"{owner_display_line(owner)}\n"
+            f"⭐ {float(owner.get('rating') or 0.0):.1f}/5.0  ({int(owner.get('total_swaps') or 0)} intercambios)\n"
+            f"{contact_line}\n\n"
         )
+
+        # If owner has no username, attach markup (we can only attach one markup to the whole message)
+        if last_markup is None:
+            last_markup = contact_button(owner)
+
         shown += 1
         if len(message) > 3800:
             break
@@ -603,7 +694,7 @@ async def search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(results) > shown:
         message += f"… y {len(results) - shown} resultados más"
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, reply_markup=last_markup)
     return ConversationHandler.END
 
 
@@ -628,18 +719,32 @@ async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platforms.setdefault(game["platform"], []).append(game)
 
     message = f"📚 CATÁLOGO COMPLETO ({len(games)} juegos)\n\n"
+    last_markup = None
+
     for platform, games_list in platforms.items():
         message += f"🎮 {platform} ({len(games_list)}):\n"
         for game in games_list[:5]:
             owner = db.get_user(int(game["user_id"]))
-            if owner:
-                message += f" • {game['title']} (@{owner['username']})\n"
+            if not owner:
+                continue
+
+            if has_real_username(owner):
+                message += f" • {game['title']} ({fmt_user(owner)})\n"
+            else:
+                message += f" • {game['title']} (dueño sin @username)\n"
+                if last_markup is None:
+                    last_markup = contact_button(owner)
+
         if len(games_list) > 5:
             message += f"   … y otros {len(games_list) - 5}\n"
         message += "\n"
 
+        if len(message) > 3800:
+            message += "… (truncated)\n"
+            break
+
     message += "Para buscar un juego concreto usa:\n/search [nombre]"
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, reply_markup=last_markup)
 
 
 # ============================
@@ -662,10 +767,11 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rating = summary.get("rating", float(user.get("rating") or 0.0))
     rating_count = summary.get("rating_count", 0)
 
+    username_line = fmt_user(user) if has_real_username(user) else "(sin @username)"
     message = (
         "👤 TU PERFIL\n\n"
         f"Nombre: {user['display_name']}\n"
-        f"Usuario: @{user['username']}\n"
+        f"Usuario: {username_line}\n"
         f"📍 Ciudad: {user['city']}\n"
         f"⭐ Valoración: {float(rating):.1f}/5.0 ({int(rating_count)} votos)\n"
         f"🔄 Intercambios completados: {int(user['total_swaps'] or 0)}\n"
@@ -767,14 +873,10 @@ async def swap_input_other_username(update: Update, context: ContextTypes.DEFAUL
 
     kb = []
     for s in suggestions:
-        kb.append(
-            [
-                InlineKeyboardButton(
-                    f"@{s['username']} ({s.get('city','')})",
-                    callback_data=f"swap_userpick:{int(s['user_id'])}",
-                )
-            ]
-        )
+        uname = _clean_username(s.get("username"))
+        label = f"@{uname}" if uname else (s.get("display_name") or "Usuario")
+        city = s.get("city", "")
+        kb.append([InlineKeyboardButton(f"{label} ({city})", callback_data=f"swap_userpick:{int(s['user_id'])}")])
     kb.append([InlineKeyboardButton("❌ Cancelar", callback_data="swap_cancel_flow")])
 
     await update.message.reply_text(
@@ -805,8 +907,9 @@ async def swap_pick_user_from_suggestions(update: Update, context: ContextTypes.
         await query.edit_message_text("❌ Usuario no encontrado.")
         return ConversationHandler.END
 
+    label = fmt_user(other)
     try:
-        await query.edit_message_text(f"✅ Usuario seleccionado: @{other['username']}\n\nCargando sus juegos…")
+        await query.edit_message_text(f"✅ Usuario seleccionado: {label}\n\nCargando sus juegos…")
     except Exception:
         pass
 
@@ -826,7 +929,8 @@ async def _swap_show_other_user_games(update: Update, context: ContextTypes.DEFA
 
     games = db.get_user_active_games(other_user_id, limit=50)
     if not games:
-        await update.effective_chat.send_message(f"📦 @{other_user['username']} no tiene juegos activos en el catálogo.")
+        label = fmt_user(other_user)
+        await update.effective_chat.send_message(f"📦 {label} no tiene juegos activos en el catálogo.")
         return SWAP_INPUT_OTHER_USERNAME
 
     keyboard = []
@@ -878,7 +982,7 @@ async def swap_select_other_game(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     context.user_data["swap_requested_game_id"] = int(requested_game_id)
-    owner = db.get_user(int(requested["user_id"])) or {"username": "SinUsuario"}
+    owner = db.get_user(int(requested["user_id"])) or {"user_id": requested["user_id"], "username": "", "display_name": "Usuario", "city": ""}
 
     confirm_text = (
         "🔄 CONFIRMAR INTERCAMBIO\n\n"
@@ -930,7 +1034,7 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     swap_id, code = created
-    initiator = db.get_user(initiator_id) or {"username": "SinUsuario"}
+    initiator = db.get_user(initiator_id) or {"user_id": initiator_id, "username": "", "display_name": "Usuario", "city": ""}
 
     await query.edit_message_text(
         "✅ Solicitud enviada.\n\n"
@@ -938,18 +1042,23 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "El otro usuario debe confirmarlo en el bot."
     )
 
+    offered_game = offered
+    requested_game = requested
+
     msg = (
         "🔔 SOLICITUD DE INTERCAMBIO\n\n"
         f"{fmt_user(initiator)} propone:\n\n"
-        f"Él/ella te da: 🎮 {fmt_game(offered)}\n"
-        f"Y quiere: 🎮 {fmt_game(requested)}\n\n"
+        f"Él/ella te da: 🎮 {fmt_game(offered_game)}\n"
+        f"Y quiere: 🎮 {fmt_game(requested_game)}\n\n"
         f"📌 Código: {code}\n\n"
         "¿Confirmas que el intercambio se realizó?"
     )
+
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✅ Confirmar", callback_data=f"swap_accept:{swap_id}")],
             [InlineKeyboardButton("❌ Rechazar", callback_data=f"swap_reject:{swap_id}")],
+            [InlineKeyboardButton("💬 Escribir al iniciador", url=contact_url(initiator_id))],
         ]
     )
 
@@ -1008,6 +1117,7 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(
             chat_id=int(swap["user1_id"]),
             text="✅ Tu intercambio fue confirmado. Los juegos cambiaron de dueño.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Escribir al otro usuario", url=contact_url(int(swap["user2_id"])))]])
         )
     except Exception:
         logger.exception("Failed to notify initiator after swap completion")
@@ -1052,7 +1162,7 @@ async def start_feedback_for_user(
     ratee_user_id: int,
     swap_id: int,
 ):
-    ratee = db.get_user(ratee_user_id) or {"username": "SinUsuario"}
+    ratee = db.get_user(ratee_user_id) or {"user_id": ratee_user_id, "username": "", "display_name": "Usuario", "city": ""}
     text = (
         "⭐ VALORACIÓN DEL INTERCAMBIO\n\n"
         f"Valora a {fmt_user(ratee)}.\n"
@@ -1268,10 +1378,11 @@ async def admin_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Usuario no encontrado.")
         return
 
+    uname = _clean_username(u.get("username"))
     text = (
         "👮 ADMIN — USER\n\n"
         f"ID: {u['user_id']}\n"
-        f"Username: @{u.get('username','')}\n"
+        f"Username: @{uname if uname else '—'}\n"
         f"Name: {u.get('display_name','')}\n"
         f"City: {u.get('city','')}\n"
         f"Banned: {int(u.get('is_banned') or 0)}\n"
@@ -1279,7 +1390,7 @@ async def admin_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Swaps: {int(u.get('total_swaps') or 0)}\n"
         f"Registered: {str(u.get('registered_date',''))[:19]}\n"
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Escribir", url=contact_url(int(u["user_id"])))]]) )
 
 
 async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):

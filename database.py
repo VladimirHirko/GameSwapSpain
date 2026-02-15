@@ -8,12 +8,12 @@ Versión: swaps (pending->completed con cambio de dueño) + feedback (rating/com
 Compatible con Railway (ruta por defecto /data/gameswap.db)
 
 ✅ Fix clave (por tu bug actual):
-- Búsqueda por username ahora es case-insensitive (COLLATE NOCASE)
-- Normalización de username (sin @, strip) + guardado consistente
-- search_users_by_username() y get_user_by_username() funcionan aunque el usuario escriba @VladIsss_77 o vladisss_77
+- Username en DB ya NO usa "SinUsuario" como valor real.
+- Si no hay username en Telegram -> guardamos "" (string vacío).
+- Migración: convierte "SinUsuario" existentes a "".
+- Búsqueda por username sigue siendo case-insensitive (COLLATE NOCASE)
 
 ✅ Otros fixes:
-- update_user_rating() tenía SQL roto (número de parámetros incorrecto) -> arreglado
 - conexiones con busy_timeout + WAL (si se puede) + FK ON
 - create_user(): si ya existe el user_id, actualiza datos en vez de fallar
 - índices útiles + UNIQUE feedback por swap/from_user
@@ -82,11 +82,12 @@ class Database:
             pass
 
         # ---- users
+        # IMPORTANT: username can be empty string, so we don't enforce NOT NULL.
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                username TEXT NOT NULL,
+                username TEXT,
                 display_name TEXT NOT NULL,
                 city TEXT NOT NULL,
                 district TEXT,
@@ -186,8 +187,16 @@ class Database:
         if "rating_count" not in cols_users:
             cur.execute("ALTER TABLE users ADD COLUMN rating_count INTEGER DEFAULT 0")
 
+        # ---- DATA MIGRATION: old placeholder "SinUsuario" -> ""
+        try:
+            cur.execute(
+                "UPDATE users SET username = '' WHERE username IS NOT NULL AND LOWER(username) = 'sinusuario'"
+            )
+        except Exception:
+            pass
+
         # ---- Indexes
-        # ВАЖНО: username case-insensitive
+        # username case-insensitive (still ok if empty)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_games_status ON games(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_games_user_status ON games(user_id, status)")
@@ -210,8 +219,11 @@ class Database:
     def create_user(self, user_id: int, username: str, display_name: str, city: str) -> bool:
         """
         Создаёт пользователя. Если уже существует user_id — обновляет данные.
+        Username:
+          - если есть @username -> сохраняем (без @)
+          - если нет -> сохраняем "" (НЕ "SinUsuario")
         """
-        u = self._normalize_username(username) or "SinUsuario"
+        u = self._normalize_username(username)  # may be ""
         dn = (display_name or "SinNombre").strip()
         ct = (city or "SinCiudad").strip()
 
@@ -221,7 +233,6 @@ class Database:
             cur = conn.cursor()
             cur.execute("BEGIN")
 
-            # если уже есть — обновим
             cur.execute("SELECT user_id FROM users WHERE user_id = ?", (int(user_id),))
             exists = cur.fetchone() is not None
 
@@ -271,6 +282,7 @@ class Database:
     def get_user_by_username(self, username: str) -> Optional[Dict]:
         """
         Buscar usuario por username de Telegram (con o sin @) CASE-INSENSITIVE.
+        Nota: si username vacío -> None.
         """
         u = self._normalize_username(username)
         if not u:
@@ -289,6 +301,7 @@ class Database:
     def search_users_by_username(self, query: str, limit: int = 10) -> List[Dict]:
         """
         Подсказки по username (LIKE) CASE-INSENSITIVE.
+        Пустые usernames не будут в результатах.
         """
         q = self._normalize_username(query)
         if not q:
@@ -299,7 +312,7 @@ class Database:
             cur.execute(
                 """
                 SELECT * FROM users
-                WHERE username LIKE ? COLLATE NOCASE
+                WHERE username != '' AND username LIKE ? COLLATE NOCASE
                 ORDER BY total_swaps DESC, rating DESC
                 LIMIT ?
                 """,
@@ -491,7 +504,7 @@ class Database:
 
     def search_games(self, query: str) -> List[Dict]:
         """
-        Поиск по названию игры CASE-INSENSITIVE (spidir man -> Spider Man найдёт).
+        Поиск по названию игры CASE-INSENSITIVE.
         """
         try:
             q = (query or "").strip()
@@ -753,9 +766,7 @@ class Database:
             conn.commit()
             conn.close()
 
-            # агрегаты рейтинга
             self.apply_user_rating(to_user_id=int(to_user_id), stars=int(stars))
-
             return int(feedback_id)
         except Exception as e:
             logger.error("❌ Error add_feedback: %s", e)
@@ -832,11 +843,9 @@ class Database:
             logger.error("❌ Error get_user_feedback: %s", e)
             return []
 
-
     # ============================
     # ADMIN HELPERS (minimal set)
     # ============================
-
     def admin_list_users(
         self,
         limit: int = 10,
@@ -844,12 +853,6 @@ class Database:
         only_banned: bool = False,
         query: Optional[str] = None,
     ) -> List[Dict]:
-        """
-        Список пользователей для админки.
-        - пагинация: limit/offset
-        - only_banned: показать только забаненных
-        - query: поиск по username/display_name/city (case-insensitive)
-        """
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -895,7 +898,6 @@ class Database:
             return []
 
     def admin_count_users(self, only_banned: bool = False, query: Optional[str] = None) -> int:
-        """Сколько пользователей подходит под фильтр (для пагинации)."""
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -935,11 +937,6 @@ class Database:
             return 0
 
     def admin_get_user(self, user_ref: str) -> Optional[Dict]:
-        """
-        Получить пользователя по:
-        - числовому user_id
-        - @username / username
-        """
         if user_ref is None:
             return None
 
@@ -947,19 +944,12 @@ class Database:
         if not s:
             return None
 
-        # пробуем как user_id
         if s.isdigit():
             return self.get_user(int(s))
 
-        # иначе как username
         return self.get_user_by_username(s)
 
     def admin_ban_user(self, user_ref: str, reason: Optional[str] = None) -> bool:
-        """
-        Бан пользователя: is_banned=1.
-        reason пока не сохраняем в БД (можно позже добавить admin_notes),
-        но логируем.
-        """
         u = self.admin_get_user(user_ref)
         if not u:
             return False
@@ -976,7 +966,6 @@ class Database:
             return False
 
     def admin_unban_user(self, user_ref: str) -> bool:
-        """Снять бан: is_banned=0."""
         u = self.admin_get_user(user_ref)
         if not u:
             return False
@@ -993,7 +982,6 @@ class Database:
             return False
 
     def admin_list_user_games(self, user_ref: str, include_removed: bool = True, limit: int = 50) -> List[Dict]:
-        """Игры пользователя (по user_id или @username)."""
         u = self.admin_get_user(user_ref)
         if not u:
             return []
@@ -1030,10 +1018,6 @@ class Database:
             return []
 
     def admin_remove_game(self, game_id: int) -> bool:
-        """
-        Админ-снятие игры: status='removed' без проверки user_id.
-        (Пользовательский remove_game() требует user_id — админке это неудобно.)
-        """
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -1050,7 +1034,6 @@ class Database:
             return False
 
     def admin_list_swaps(self, status: Optional[str] = None, limit: int = 20, offset: int = 0) -> List[Dict]:
-        """Список свапов (последние), опционально по статусу."""
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -1083,7 +1066,6 @@ class Database:
             return []
 
     def admin_get_stats(self) -> Dict:
-        """Быстрая статистика для /admin_stats."""
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -1120,4 +1102,3 @@ class Database:
                 "swaps_pending": 0,
                 "swaps_completed": 0,
             }
-
