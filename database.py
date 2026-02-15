@@ -503,30 +503,34 @@ class Database:
             return []
 
     def search_games(self, query: str) -> List[Dict]:
-        """
-        Поиск по названию игры CASE-INSENSITIVE.
-        """
         try:
             q = (query or "").strip()
             if not q:
                 return []
+
             conn = self.get_connection()
             cur = conn.cursor()
+
             cur.execute(
                 """
-                SELECT * FROM games
-                WHERE status = 'active'
-                  AND title LIKE ? COLLATE NOCASE
-                ORDER BY created_date DESC
+                SELECT g.*
+                FROM games g
+                JOIN users u ON g.user_id = u.user_id
+                WHERE g.status = 'active'
+                  AND g.title LIKE ? COLLATE NOCASE
+                ORDER BY u.total_swaps DESC, u.rating DESC, g.created_date DESC
                 """,
                 (f"%{q}%",),
             )
+
             rows = cur.fetchall()
             conn.close()
             return [dict(r) for r in rows]
+
         except Exception as e:
-            logger.error("❌ Error en la búsqueda de juegos: %s", e)
+            logger.error("❌ Error search_games: %s", e)
             return []
+
 
     def remove_game(self, game_id: int, user_id: int) -> bool:
         try:
@@ -564,24 +568,58 @@ class Database:
     def create_swap_request(
         self, user1_id: int, user2_id: int, game1_id: int, game2_id: int
     ) -> Optional[Tuple[int, str]]:
+
+        if int(user1_id) == int(user2_id):
+            return None
+
+        conn: Optional[sqlite3.Connection] = None
         try:
             conn = self.get_connection()
             cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
 
+            # Проверка существования игр
             cur.execute(
                 "SELECT game_id, user_id, status FROM games WHERE game_id IN (?, ?)",
                 (int(game1_id), int(game2_id)),
             )
             rows = cur.fetchall()
             if len(rows) != 2:
+                conn.rollback()
                 conn.close()
                 return None
 
             info = {int(r["game_id"]): dict(r) for r in rows}
-            if info.get(int(game1_id), {}).get("user_id") != int(user1_id) or info.get(int(game2_id), {}).get("user_id") != int(user2_id):
+
+            if info[game1_id]["user_id"] != int(user1_id):
+                conn.rollback()
                 conn.close()
                 return None
-            if info[int(game1_id)]["status"] != "active" or info[int(game2_id)]["status"] != "active":
+
+            if info[game2_id]["user_id"] != int(user2_id):
+                conn.rollback()
+                conn.close()
+                return None
+
+            if info[game1_id]["status"] != "active" or info[game2_id]["status"] != "active":
+                conn.rollback()
+                conn.close()
+                return None
+
+            # Проверяем, нет ли уже pending swap
+            cur.execute(
+                """
+                SELECT swap_id FROM swaps
+                WHERE status = 'pending'
+                  AND (
+                        (game1_id = ? AND game2_id = ?)
+                     OR (game1_id = ? AND game2_id = ?)
+                  )
+                """,
+                (game1_id, game2_id, game2_id, game1_id),
+            )
+            if cur.fetchone():
+                conn.rollback()
                 conn.close()
                 return None
 
@@ -597,16 +635,22 @@ class Database:
                 )
                 VALUES (?, ?, ?, ?, 1, 0, 'pending', ?, ?, ?)
                 """,
-                (int(user1_id), int(user2_id), int(game1_id), int(game2_id), code, now, now),
+                (user1_id, user2_id, game1_id, game2_id, code, now, now),
             )
 
             swap_id = cur.lastrowid
             conn.commit()
             conn.close()
+
             return int(swap_id), code
+
         except Exception as e:
-            logger.error("❌ Error al crear intercambio: %s", e)
+            if conn:
+                conn.rollback()
+                conn.close()
+            logger.error("❌ Error create_swap_request: %s", e)
             return None
+
 
     def get_swap(self, swap_id: int) -> Optional[Dict]:
         try:
@@ -640,51 +684,54 @@ class Database:
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            cur.execute("BEGIN")
+            cur.execute("BEGIN IMMEDIATE")
 
             cur.execute("SELECT * FROM swaps WHERE swap_id = ?", (int(swap_id),))
-            swap_row = cur.fetchone()
-            if not swap_row:
-                cur.execute("ROLLBACK")
+            row = cur.fetchone()
+
+            if not row:
+                conn.rollback()
                 return False, "swap not found"
 
-            swap = dict(swap_row)
+            swap = dict(row)
 
-            if swap.get("status") != "pending":
-                cur.execute("ROLLBACK")
-                return False, f"swap status is {swap.get('status')}"
+            if swap["status"] != "pending":
+                conn.rollback()
+                return False, "swap not pending"
 
             if int(confirmer_user_id) != int(swap["user2_id"]):
-                cur.execute("ROLLBACK")
+                conn.rollback()
                 return False, "only recipient can confirm"
 
-            user1_id = int(swap["user1_id"])
-            user2_id = int(swap["user2_id"])
-            game1_id = int(swap["game1_id"])
-            game2_id = int(swap["game2_id"])
+            g1_id = int(swap["game1_id"])
+            g2_id = int(swap["game2_id"])
 
             cur.execute(
                 "SELECT game_id, user_id, status FROM games WHERE game_id IN (?, ?)",
-                (game1_id, game2_id),
+                (g1_id, g2_id),
             )
-            rows = cur.fetchall()
-            if len(rows) != 2:
-                cur.execute("ROLLBACK")
-                return False, "game not found"
+            games = cur.fetchall()
 
-            g = {int(r["game_id"]): dict(r) for r in rows}
-            if int(g[game1_id]["user_id"]) != user1_id or int(g[game2_id]["user_id"]) != user2_id:
-                cur.execute("ROLLBACK")
-                return False, "owners changed; cannot complete"
-            if g[game1_id]["status"] != "active" or g[game2_id]["status"] != "active":
-                cur.execute("ROLLBACK")
-                return False, "one of games not active"
+            if len(games) != 2:
+                conn.rollback()
+                return False, "games missing"
 
-            # swap owners
-            cur.execute("UPDATE games SET user_id = ? WHERE game_id = ?", (user2_id, game1_id))
-            cur.execute("UPDATE games SET user_id = ? WHERE game_id = ?", (user1_id, game2_id))
+            g = {int(r["game_id"]): dict(r) for r in games}
+
+            if g[g1_id]["status"] != "active" or g[g2_id]["status"] != "active":
+                conn.rollback()
+                return False, "game not active"
+
+            if g[g1_id]["user_id"] != swap["user1_id"] or g[g2_id]["user_id"] != swap["user2_id"]:
+                conn.rollback()
+                return False, "ownership changed"
+
+            # Меняем владельцев
+            cur.execute("UPDATE games SET user_id = ? WHERE game_id = ?", (swap["user2_id"], g1_id))
+            cur.execute("UPDATE games SET user_id = ? WHERE game_id = ?", (swap["user1_id"], g2_id))
 
             now = self._now()
+
             cur.execute(
                 """
                 UPDATE swaps
@@ -694,25 +741,24 @@ class Database:
                     updated_date = ?
                 WHERE swap_id = ?
                 """,
-                (now, now, int(swap_id)),
+                (now, now, swap_id),
             )
 
             cur.execute(
                 "UPDATE users SET total_swaps = total_swaps + 1 WHERE user_id IN (?, ?)",
-                (user1_id, user2_id),
+                (swap["user1_id"], swap["user2_id"]),
             )
 
             conn.commit()
             conn.close()
             return True, ""
+
         except Exception as e:
-            try:
-                if conn:
-                    conn.rollback()
-                    conn.close()
-            except Exception:
-                pass
+            if conn:
+                conn.rollback()
+                conn.close()
             return False, str(e)
+
 
     def get_total_swaps(self) -> int:
         try:

@@ -4,33 +4,18 @@
 GameSwap Spain Bot
 Bot para intercambio de juegos entre gamers
 
-Versión:
-- Registro + catálogo + поиск
-- Swap (Variant A) + улучшение: выбор игры через @username владельца (без ввода названия)
-- Feedback (rating + comment + photos) tras swap completado
-Requiere database.py (con swaps + feedback + métodos de username + admin_*)
+Версия (исправленная):
+- Регистрация + добавление игр + поиск + каталог + профиль
+- Контакт владельца ВСЕГДА через tg://user?id=<user_id> (работает без @username)
+- Swap: выбираем свою игру -> вводим название полученной игры -> выбираем ТОЧНУЮ карточку (игра+владелец) -> отправляем запрос
+  ✅ Это решает ситуацию, когда одна и та же игра есть у нескольких пользователей
+  ✅ Не требуется @username вообще
 
-Fixes importantes:
-- Feedback: NO vuelve a llamar apply_user_rating() (db.add_feedback() ya lo hace)
-- Feedback: sesión por chat_data con key único (swap+to_user), не мешает параллельным сессиям
-- /skip y /done funcionan correctamente
+Feedback (rating + comment + photos) tras swap completado
+ADMIN minimal + Ban guard — как было
 
-ADMIN (minimal):
-- /admin_users [+query] + кнопки Prev/Next/Filter/Clear
-- /admin_user <id|@username>
-- /admin_ban <id|@username> [reason]
-- /admin_unban <id|@username>
-- /admin_games <id|@username>
-- /admin_remove_game <game_id>
-- /admin_swaps [pending|completed|rejected]
-- /admin_stats
-
-BAN GUARD:
-- Забаненный пользователь не может использовать /add /mygames /search /catalog /profile /swap
-
-IMPORTANT FIX (NO USERNAME):
-- Если у пользователя нет telegram @username, мы НЕ показываем фейковый @SinUsuario.
-- Контакт делаем через tg://user?id=<user_id> + кнопка "Escribir al dueño".
+ВАЖНО:
+- Удали старый swap-поток по @username (в этой версии его нет).
 """
 
 import os
@@ -76,8 +61,8 @@ REGISTRATION_NAME, REGISTRATION_CITY = range(2)
 ADD_GAME_TITLE, ADD_GAME_PLATFORM, ADD_GAME_CONDITION, ADD_GAME_PHOTO, ADD_GAME_LOOKING = range(5)
 SEARCH_QUERY = 0
 
-# Swap flow states
-SWAP_SELECT_OWN, SWAP_INPUT_OTHER_USERNAME, SWAP_SELECT_OTHER_GAME, SWAP_CONFIRM = range(4)
+# Swap flow states (НОВЫЙ поток без @username)
+SWAP_SELECT_OWN, SWAP_INPUT_OTHER_TITLE, SWAP_SELECT_OTHER_GAME, SWAP_CONFIRM = range(4)
 
 # Feedback flow states
 FB_TEXT, FB_PHOTOS = range(2)
@@ -143,31 +128,23 @@ def fmt_game(g: dict) -> str:
     return f"{g['title']} ({g['platform']}, {g['condition']})"
 
 
-def _norm_username(text: str) -> str:
-    t = (text or "").strip()
-    if t.startswith("@"):
-        t = t[1:]
-    return t.strip()
-
-
 def user_has_username(u: dict) -> bool:
     return bool((u.get("username") or "").strip())
 
 
 def user_label(u: dict) -> str:
     """
-    Безопасный текстовый лейбл пользователя.
+    Безопасный лейбл для текста.
     Если есть @username -> @username
-    Если нет -> Имя (ID:123)
+    Если нет -> display_name
+    (ID публично НЕ показываем)
     """
     if user_has_username(u):
         un = (u.get("username") or "").strip()
         if not un.startswith("@"):
             un = "@" + un
         return un
-    dn = (u.get("display_name") or "Usuario").strip()
-    uid = int(u.get("user_id") or 0)
-    return f"{dn} (ID:{uid})"
+    return (u.get("display_name") or "Usuario").strip()
 
 
 def user_contact_url(u: dict) -> str | None:
@@ -241,9 +218,10 @@ def _admin_users_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 def _fmt_user_line(u: dict) -> str:
     ban = "🚫" if int(u.get("is_banned") or 0) == 1 else "✅"
-    # В админке тоже безопасно показываем
+    uname = (u.get("username") or "").strip()
+    uname_line = f"@{uname}" if uname else "—"
     return (
-        f"{ban} {u.get('user_id')}  {user_label(u)} | {u.get('display_name','')} | {u.get('city','')} | "
+        f"{ban} {u.get('user_id')}  {uname_line} | {u.get('display_name','')} | {u.get('city','')} | "
         f"⭐{float(u.get('rating') or 0.0):.1f} ({int(u.get('rating_count') or 0)}) | 🔄{int(u.get('total_swaps') or 0)}"
     )
 
@@ -361,8 +339,7 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return REGISTRATION_CITY
 
     user_id = update.effective_user.id
-    # IMPORTANT: если username отсутствует -> сохраняем пустую строку (НЕ SinUsuario)
-    username = update.effective_user.username or ""
+    username = update.effective_user.username or ""  # пустая строка, если нет
     display_name = context.user_data.get("display_name", "SinNombre")
 
     db.create_user(user_id, username, display_name, city)
@@ -394,10 +371,12 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Operación cancelada.", reply_markup=ReplyKeyboardRemove())
+    if update.message:
+        await update.message.reply_text("❌ Operación cancelada.", reply_markup=ReplyKeyboardRemove())
     context.user_data.pop("swap_offered_game_id", None)
     context.user_data.pop("swap_other_user_id", None)
     context.user_data.pop("swap_requested_game_id", None)
+    context.user_data.pop("swap_other_title", None)
     return ConversationHandler.END
 
 
@@ -641,7 +620,7 @@ async def search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎮 {game['title']}\n"
             f"📱 {game['platform']}  |  ⭐ {game['condition']}\n"
             f"🔄 Busca: {game['looking_for']}\n"
-            f"👤 Dueño: {user_label(owner)} ({owner.get('city','')})\n"
+            f"👤 Dueño: {owner.get('display_name','Usuario')} ({owner.get('city','')})\n"
             f"⭐ {float(owner.get('rating') or 0.0):.1f}/5.0  ({int(owner.get('total_swaps') or 0)} intercambios)\n"
         )
 
@@ -688,14 +667,13 @@ async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for game in games_list[:5]:
             owner = db.get_user(int(game["user_id"]))
             if owner:
-                message += f" • {game['title']} (dueño: {user_label(owner)})\n"
+                # В каталоге не показываем @username и не показываем ID
+                message += f" • {game['title']} (dueño: {owner.get('display_name','Usuario')})\n"
         if len(games_list) > 5:
             message += f"   … y otros {len(games_list) - 5}\n"
         message += "\n"
 
-    message += "Para buscar un juego concreto usa:\n/search [nombre]\n\n"
-    message += "ℹ️ Si un dueño no tiene @username, el bot mostrará su nombre e ID y podrás escribirle con el botón desde /search."
-
+    message += "Para buscar un juego concreto usa:\n/search [nombre]\n"
     await update.message.reply_text(message)
 
 
@@ -743,7 +721,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================
-# SWAP FLOW (Variant A)
+# SWAP FLOW (НОВЫЙ: по названию игры, без @username)
 # ============================
 async def swap_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await banned_guard(update, context):
@@ -785,119 +763,58 @@ async def swap_select_own(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["swap_offered_game_id"] = game_id
     context.user_data.pop("swap_other_user_id", None)
     context.user_data.pop("swap_requested_game_id", None)
+    context.user_data.pop("swap_other_title", None)
 
     await query.edit_message_text(
-        "Paso 2/3 — Escribe el @username del otro usuario (dueño del juego que recibiste).\n\n"
-        "Ejemplo: @pepe_gamer\n\n"
-        "Si no estás seguro, escribe parte del username y te mostraré sugerencias.\n"
+        "Paso 2/3 — Escribe el nombre del juego que RECIBISTE.\n\n"
+        "Ejemplo: GTA, Elden Ring, Mario...\n"
         "Cancelar: /cancel"
     )
-    return SWAP_INPUT_OTHER_USERNAME
+    return SWAP_INPUT_OTHER_TITLE
 
 
-async def swap_input_other_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = (update.message.text or "").strip()
+async def swap_input_other_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = (update.message.text or "").strip()
+    if not q:
+        await update.message.reply_text("❌ Escribe un nombre de juego o /cancel.")
+        return SWAP_INPUT_OTHER_TITLE
 
-    u = _norm_username(text)
-    if not u:
-        await update.message.reply_text("❌ Escribe un @username válido. Ejemplo: @pepe_gamer")
-        return SWAP_INPUT_OTHER_USERNAME
+    my_id = int(update.effective_user.id)
+    context.user_data["swap_other_title"] = q
 
-    other = db.get_user_by_username(u)
-    if other and int(other["user_id"]) == int(user_id):
-        await update.message.reply_text("❌ No puedes intercambiar contigo mismo. Escribe el @username del otro usuario.")
-        return SWAP_INPUT_OTHER_USERNAME
+    results = db.search_games(q)
+    # убираем свои игры
+    results = [g for g in results if int(g["user_id"]) != my_id]
 
-    if other:
-        context.user_data["swap_other_user_id"] = int(other["user_id"])
-        return await _swap_show_other_user_games(update, context, int(other["user_id"]))
-
-    suggestions = db.search_users_by_username(u, limit=10)
-    suggestions = [s for s in suggestions if int(s["user_id"]) != int(user_id)]
-
-    if not suggestions:
+    if not results:
         await update.message.reply_text(
-            "😔 No encontré ese usuario en la base.\n\n"
-            "Consejos:\n"
-            "• Asegúrate que el usuario se registró con /start\n"
-            "• Escribe parte del username para ver sugerencias\n"
-            "• O pide al otro usuario que haga /start"
+            f"😔 No encontré «{q}» en el catálogo.\n"
+            "Escribe otro nombre o /cancel."
         )
-        return SWAP_INPUT_OTHER_USERNAME
+        return SWAP_INPUT_OTHER_TITLE
 
     kb = []
-    for s in suggestions:
-        kb.append(
-            [
-                InlineKeyboardButton(
-                    f"{user_label(s)} ({s.get('city','')})",
-                    callback_data=f"swap_userpick:{int(s['user_id'])}",
-                )
-            ]
-        )
+    shown = 0
+    for g in results:
+        owner = db.get_user(int(g["user_id"]))
+        if not owner:
+            continue
+
+        # Укорачиваем подпись кнопки, чтобы Telegram не ругался
+        owner_name = owner.get("display_name", "Usuario")
+        city = owner.get("city", "")
+        btn = f"{g['title']} | {g['platform']} | {owner_name} {('('+city+')') if city else ''}"
+        kb.append([InlineKeyboardButton(btn[:60], callback_data=f"swap_take:{int(g['game_id'])}")])
+
+        shown += 1
+        if shown >= 10:
+            break
+
     kb.append([InlineKeyboardButton("❌ Cancelar", callback_data="swap_cancel_flow")])
 
     await update.message.reply_text(
-        "No encontré coincidencia exacta. ¿Es uno de estos usuarios?",
+        "Paso 3/3 — Elige la tarjeta EXACTA (juego + dueño):",
         reply_markup=InlineKeyboardMarkup(kb),
-    )
-    return SWAP_INPUT_OTHER_USERNAME
-
-
-async def swap_pick_user_from_suggestions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "swap_cancel_flow":
-        await query.edit_message_text("❌ Intercambio cancelado.")
-        return ConversationHandler.END
-
-    _, user_id_str = query.data.split(":")
-    other_user_id = int(user_id_str)
-
-    if other_user_id == int(update.effective_user.id):
-        await query.edit_message_text("❌ No puedes seleccionarte a ti mismo.")
-        return ConversationHandler.END
-
-    context.user_data["swap_other_user_id"] = other_user_id
-    other = db.get_user(other_user_id)
-    if not other:
-        await query.edit_message_text("❌ Usuario no encontrado.")
-        return ConversationHandler.END
-
-    try:
-        await query.edit_message_text(f"✅ Usuario seleccionado: {user_label(other)}\n\nCargando sus juegos…")
-    except Exception:
-        pass
-
-    return await _swap_show_other_user_games(update, context, other_user_id)
-
-
-async def _swap_show_other_user_games(update: Update, context: ContextTypes.DEFAULT_TYPE, other_user_id: int):
-    offered_game_id = context.user_data.get("swap_offered_game_id")
-    if not offered_game_id:
-        await update.effective_chat.send_message("❌ Sesión caducada. Empieza de nuevo: /swap")
-        return ConversationHandler.END
-
-    other_user = db.get_user(other_user_id)
-    if not other_user:
-        await update.effective_chat.send_message("❌ Usuario no encontrado.")
-        return ConversationHandler.END
-
-    games = db.get_user_active_games(other_user_id, limit=50)
-    if not games:
-        await update.effective_chat.send_message(f"📦 {user_label(other_user)} no tiene juegos activos en el catálogo.")
-        return SWAP_INPUT_OTHER_USERNAME
-
-    keyboard = []
-    for g in games[:25]:
-        keyboard.append([InlineKeyboardButton(fmt_game(g), callback_data=f"swap_take:{int(g['game_id'])}")])
-    keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="swap_cancel_flow")])
-
-    await update.effective_chat.send_message(
-        "Paso 3/3 — Elige el juego que recibiste (del catálogo del usuario):",
-        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return SWAP_SELECT_OTHER_GAME
 
@@ -914,8 +831,7 @@ async def swap_select_other_game(update: Update, context: ContextTypes.DEFAULT_T
     requested_game_id = int(game_id_str)
 
     offered_game_id = context.user_data.get("swap_offered_game_id")
-    other_user_id = context.user_data.get("swap_other_user_id")
-    if not offered_game_id or not other_user_id:
+    if not offered_game_id:
         await query.edit_message_text("❌ Sesión caducada. Empieza de nuevo: /swap")
         return ConversationHandler.END
 
@@ -930,22 +846,21 @@ async def swap_select_other_game(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ El juego ofrecido no es tuyo.")
         return ConversationHandler.END
 
-    if int(requested["user_id"]) != int(other_user_id):
-        await query.edit_message_text("❌ Este juego no pertenece al usuario seleccionado.")
-        return ConversationHandler.END
-
     if int(requested["user_id"]) == int(update.effective_user.id):
         await query.edit_message_text("❌ No puedes intercambiar contigo mismo.")
         return ConversationHandler.END
 
+    other_user_id = int(requested["user_id"])
+    context.user_data["swap_other_user_id"] = other_user_id
     context.user_data["swap_requested_game_id"] = int(requested_game_id)
-    owner = db.get_user(int(requested["user_id"])) or {"user_id": int(requested["user_id"]), "display_name": "Usuario"}
+
+    owner = db.get_user(other_user_id) or {"user_id": other_user_id, "display_name": "Usuario"}
 
     confirm_text = (
         "🔄 CONFIRMAR INTERCAMBIO\n\n"
         f"Tú das:  🎮 {fmt_game(offered)}\n"
         f"Tú recibes: 🎮 {fmt_game(requested)}\n\n"
-        f"Con: {user_label(owner)}\n\n"
+        f"Con: {owner.get('display_name','Usuario')} ({owner.get('city','')})\n\n"
         "¿Enviar solicitud de confirmación?"
     )
     keyboard = [
@@ -1001,7 +916,7 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         "🔔 SOLICITUD DE INTERCAMBIO\n\n"
-        f"{user_label(initiator)} propone:\n\n"
+        f"{initiator.get('display_name','Usuario')} propone:\n\n"
         f"Él/ella te da: 🎮 {fmt_game(offered)}\n"
         f"Y quiere: 🎮 {fmt_game(requested)}\n\n"
         f"📌 Código: {code}\n\n"
@@ -1083,7 +998,7 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
                 context,
                 text=(
                     "🔄 Intercambio completado\n\n"
-                    f"{user_label(u1)} ↔ {user_label(u2)}\n"
+                    f"{u1.get('display_name','Usuario')} ↔ {u2.get('display_name','Usuario')}\n"
                     f"🎮 {g1['title']} ⇄ 🎮 {g2['title']}"
                 ),
                 parse_mode=None,
@@ -1117,7 +1032,7 @@ async def start_feedback_for_user(
     ratee = db.get_user(ratee_user_id) or {"user_id": ratee_user_id, "display_name": "Usuario"}
     text = (
         "⭐ VALORACIÓN DEL INTERCAMBIO\n\n"
-        f"Valora a {user_label(ratee)}.\n"
+        f"Valora a {ratee.get('display_name','Usuario')}.\n"
         "Elige estrellas:"
     )
     kb = InlineKeyboardMarkup(
@@ -1244,7 +1159,6 @@ async def fb_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update.effective_user.id):
-        # чтобы не было ощущения “любой может”
         if update.message:
             await update.message.reply_text("⛔ No access.")
         return
@@ -1515,7 +1429,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/profile   — mi perfil\n"
         "/swap      — confirmar intercambio\n"
         "/help      — esta ayuda\n\n"
-        "ℹ️ Nota: Si un usuario no tiene @username, igual puedes escribirle: el bot usa su ID.\n"
+        "ℹ️ Nota: Para contactar, el bot usa enlace directo (funciona incluso sin @username).\n"
     )
     await update.message.reply_text(help_text)
 
@@ -1587,13 +1501,8 @@ def main():
         entry_points=[CommandHandler("swap", swap_start)],
         states={
             SWAP_SELECT_OWN: [CallbackQueryHandler(swap_select_own, pattern="^swap_offer:")],
-            SWAP_INPUT_OTHER_USERNAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, swap_input_other_username),
-                CallbackQueryHandler(swap_pick_user_from_suggestions, pattern="^(swap_userpick:|swap_cancel_flow$)"),
-            ],
-            SWAP_SELECT_OTHER_GAME: [
-                CallbackQueryHandler(swap_select_other_game, pattern="^(swap_take:|swap_cancel_flow$)")
-            ],
+            SWAP_INPUT_OTHER_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, swap_input_other_title)],
+            SWAP_SELECT_OTHER_GAME: [CallbackQueryHandler(swap_select_other_game, pattern="^(swap_take:|swap_cancel_flow$)")],
             SWAP_CONFIRM: [CallbackQueryHandler(swap_confirm, pattern="^(swap_send|swap_cancel)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
