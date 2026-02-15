@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class Database:
     """Clase para gestionar la base de datos"""
    
-    def __init__(self, db_file: str = 'gameswap.db'):
+    def __init__(self, db_file: str = '/data/gameswap.db'):
         """Inicialización de la base de datos"""
         self.db_file = db_file
         self.init_database()
