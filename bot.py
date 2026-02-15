@@ -4,8 +4,8 @@
 GameSwap Spain Bot
 Bot para intercambio de juegos entre gamers
 
-Версия (актуальная):
-- Регистрация + добавление игр + поиск + каталог + профиль
+Версия (правильная, актуальная):
+- Регистрация + добавление игр + поиск + каталог (МАСТЕР) + профиль
 - Контакт владельца ВСЕГДА через tg://user?id=<user_id> (работает без @username)
 - Swap (новый поток, без @username):
   1) выбираем свою игру
@@ -15,15 +15,21 @@ Bot para intercambio de juegos entre gamers
 - Feedback (rating + comment + photos) после swap completed
 - ADMIN minimal + Ban guard
 
+CATALOG FLOW (как планировали):
+/catalog
+  1) выбрать платформу
+  2) выбрать город (как "регион" на текущем этапе)
+  3) увидеть карточки игр + кнопка контакта
+
 ВАЖНО:
-- Старый swap-поток по @username здесь отсутствует.
+- Старый swap-поток по @username отсутствует.
 """
 
 import os
 import logging
 import html
 from datetime import datetime
-from typing import Optional, Union
+from typing import Optional, Union, Dict, List, Tuple
 
 from dotenv import load_dotenv
 
@@ -69,6 +75,9 @@ SWAP_SELECT_OWN, SWAP_INPUT_OTHER_TITLE, SWAP_SELECT_OTHER_GAME, SWAP_CONFIRM = 
 
 # Feedback flow states
 FB_TEXT, FB_PHOTOS = range(2)
+
+# Catalog flow states (platform -> city -> show games)
+CATALOG_PLATFORM, CATALOG_CITY = range(2)
 
 # ----------------------------
 # DB
@@ -187,8 +196,15 @@ def stars_label(n: int) -> str:
 
 
 def _fb_key(swap_id: int, from_user_id: int, to_user_id: int) -> str:
-    # ключ делаем уникальным на пользователя-оценщика тоже
+    # ключ уникален на оценщика
     return f"fb:{int(swap_id)}:{int(from_user_id)}:{int(to_user_id)}"
+
+
+def _short_btn(text: str, max_len: int = 60) -> str:
+    t = (text or "").strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 1] + "…"
 
 
 # ----------------------------
@@ -314,7 +330,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/add - añadir un juego\n"
             "/mygames - mis juegos\n"
             "/search - buscar juego\n"
-            "/catalog - ver catálogo completo\n"
+            "/catalog - ver catálogo (por filtros)\n"
             "/profile - mi perfil\n"
             "/swap - confirmar intercambio\n"
             "/help - ayuda"
@@ -375,7 +391,7 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ahora puedes:\n"
         "/add — añadir juego para intercambio\n"
         "/search — buscar juego\n"
-        "/catalog — ver todos los juegos disponibles\n"
+        "/catalog — ver catálogo (por filtros)\n"
         "/swap — confirmar intercambio\n"
         "/help — obtener ayuda",
         reply_markup=ReplyKeyboardRemove(),
@@ -406,6 +422,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # чистим feedback session
     context.user_data.pop("fb_active_key", None)
+
+    # чистим catalog session
+    context.user_data.pop("catalog_platforms", None)
+    context.user_data.pop("catalog_platform", None)
+    context.user_data.pop("catalog_cities", None)
+    context.user_data.pop("catalog_city", None)
 
     return ConversationHandler.END
 
@@ -603,8 +625,6 @@ async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   📅 Añadido: {str(game['created_date'])[:10]}\n\n"
         )
 
-    # ВАЖНО: мы не знаем твой точный метод удаления в database.py,
-    # поэтому не обещаем /remove (чтобы не ломать UX).
     message += "ℹ️ Para eliminar: usa los comandos ADMIN o añade un método de borrado en database.py."
     await update.message.reply_text(message)
 
@@ -635,7 +655,7 @@ async def search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"😔 No se encontró «{q}» en el catálogo.\n\n"
             "Prueba con:\n"
             "• Otro nombre o forma de escribirlo\n"
-            "• /catalog — ver todo el catálogo\n"
+            "• /catalog — ver catálogo (por filtros)\n"
             "• /add — añade tu juego, ¡quizá alguien lo esté buscando!"
         )
         return ConversationHandler.END
@@ -675,39 +695,230 @@ async def search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================
-# CATALOG
+# CATALOG (FLOW: platform -> city -> cards)
 # ============================
-async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _catalog_platforms(games: List[dict], exclude_user_id: int) -> List[str]:
+    seen = set()
+    out = []
+    for g in games:
+        try:
+            if int(g.get("user_id") or 0) == int(exclude_user_id):
+                continue
+        except Exception:
+            continue
+        p = (g.get("platform") or "").strip()
+        if not p:
+            continue
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    out.sort(key=lambda s: s.lower())
+    return out
+
+
+async def catalog_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await banned_guard(update, context):
-        return
+        return ConversationHandler.END
 
-    user_id = update.effective_user.id
-    games = db.get_all_active_games()
-
+    user_id = int(update.effective_user.id)
+    games = db.get_all_active_games() or []
     if not games:
         await update.message.reply_text("📦 El catálogo está vacío por ahora.\n\n¡Sé el primero! → /add")
-        return
+        return ConversationHandler.END
 
-    platforms: dict[str, list] = {}
-    for game in games:
-        if int(game["user_id"]) == int(user_id):
+    platforms = _catalog_platforms(games, exclude_user_id=user_id)
+    if not platforms:
+        await update.message.reply_text("📦 No hay juegos de otros usuarios ahora mismo.")
+        return ConversationHandler.END
+
+    context.user_data["catalog_platforms"] = platforms
+    context.user_data.pop("catalog_platform", None)
+    context.user_data.pop("catalog_cities", None)
+    context.user_data.pop("catalog_city", None)
+
+    kb = []
+    for i, p in enumerate(platforms[:25]):
+        kb.append([InlineKeyboardButton(f"🎮 {p}", callback_data=f"cat_plat:{i}")])
+    kb.append([InlineKeyboardButton("❌ Cancelar", callback_data="cat_cancel")])
+
+    await update.message.reply_text(
+        "📚 CATÁLOGO\n\nPaso 1/3 — Elige una plataforma:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+    return CATALOG_PLATFORM
+
+
+async def catalog_choose_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "cat_cancel":
+        await q.edit_message_text("❌ Cancelado.")
+        return ConversationHandler.END
+
+    try:
+        _, idx_str = q.data.split(":")
+        idx = int(idx_str)
+        platforms = context.user_data.get("catalog_platforms") or []
+        platform = platforms[idx]
+    except Exception:
+        await q.edit_message_text("❌ Sesión caducada. Abre /catalog de nuevo.")
+        return ConversationHandler.END
+
+    context.user_data["catalog_platform"] = platform
+
+    user_id = int(update.effective_user.id)
+    games = db.get_all_active_games() or []
+    filtered = []
+    for g in games:
+        try:
+            if (g.get("platform") or "").strip() != platform:
+                continue
+            if int(g.get("user_id") or 0) == user_id:
+                continue
+            filtered.append(g)
+        except Exception:
             continue
-        platforms.setdefault(game["platform"], []).append(game)
 
-    message = f"📚 CATÁLOGO COMPLETO ({len(games)} juegos)\n\n"
-    for platform, games_list in platforms.items():
-        message += f"🎮 {platform} ({len(games_list)}):\n"
-        for game in games_list[:5]:
-            owner = db.get_user(int(game["user_id"]))
-            if owner:
-                # В каталоге не показываем @username и не показываем ID
-                message += f" • {game['title']} (dueño: {owner.get('display_name','Usuario')})\n"
-        if len(games_list) > 5:
-            message += f"   … y otros {len(games_list) - 5}\n"
-        message += "\n"
+    cities_seen = set()
+    cities = []
+    for g in filtered:
+        owner = db.get_user(int(g.get("user_id") or 0))
+        if not owner:
+            continue
+        city = (owner.get("city") or "").strip()
+        if not city:
+            continue
+        if city not in cities_seen:
+            cities_seen.add(city)
+            cities.append(city)
 
-    message += "Para buscar un juego concreto usa:\n/search\n"
-    await update.message.reply_text(message)
+    cities.sort(key=lambda s: s.lower())
+    context.user_data["catalog_cities"] = cities
+
+    kb = []
+    kb.append([InlineKeyboardButton("🌍 Todas las ciudades", callback_data="cat_city:all")])
+    for i, c in enumerate(cities[:25]):
+        kb.append([InlineKeyboardButton(_short_btn(f"📍 {c}", 60), callback_data=f"cat_city:{i}")])
+    kb.append([InlineKeyboardButton("⬅️ Atrás", callback_data="cat_back_platform")])
+    kb.append([InlineKeyboardButton("❌ Cancelar", callback_data="cat_cancel")])
+
+    await q.edit_message_text(
+        "📚 CATÁLOGO\n\n"
+        f"Paso 2/3 — Plataforma: {platform}\n"
+        "Elige una ciudad:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+    return CATALOG_CITY
+
+
+async def catalog_choose_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "cat_cancel":
+        await q.edit_message_text("❌ Cancelado.")
+        return ConversationHandler.END
+
+    if q.data == "cat_back_platform":
+        platforms = context.user_data.get("catalog_platforms") or []
+        kb = []
+        for i, p in enumerate(platforms[:25]):
+            kb.append([InlineKeyboardButton(f"🎮 {p}", callback_data=f"cat_plat:{i}")])
+        kb.append([InlineKeyboardButton("❌ Cancelar", callback_data="cat_cancel")])
+
+        await q.edit_message_text(
+            "📚 CATÁLOGO\n\nPaso 1/3 — Elige una plataforma:",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return CATALOG_PLATFORM
+
+    platform = (context.user_data.get("catalog_platform") or "").strip()
+    if not platform:
+        await q.edit_message_text("❌ Sesión caducada. Abre /catalog de nuevo.")
+        return ConversationHandler.END
+
+    selected_city = None  # None => all
+    if q.data == "cat_city:all":
+        selected_city = None
+    else:
+        try:
+            _, idx_str = q.data.split(":")
+            idx = int(idx_str)
+            cities = context.user_data.get("catalog_cities") or []
+            selected_city = cities[idx]
+        except Exception:
+            await q.edit_message_text("❌ Sesión caducada. Abre /catalog de nuevo.")
+            return ConversationHandler.END
+
+    # собираем игры
+    user_id = int(update.effective_user.id)
+    games = db.get_all_active_games() or []
+
+    results: List[Tuple[dict, dict]] = []
+    for g in games:
+        try:
+            if (g.get("platform") or "").strip() != platform:
+                continue
+            if int(g.get("user_id") or 0) == user_id:
+                continue
+
+            owner = db.get_user(int(g.get("user_id") or 0))
+            if not owner:
+                continue
+
+            owner_city = (owner.get("city") or "").strip()
+            if selected_city and owner_city.lower() != selected_city.lower():
+                continue
+
+            results.append((g, owner))
+        except Exception:
+            continue
+
+    if not results:
+        where = f" en {selected_city}" if selected_city else ""
+        await q.edit_message_text(
+            f"😔 No hay juegos para {platform}{where}.\n\nPrueba otra ciudad o plataforma con /catalog."
+        )
+        return ConversationHandler.END
+
+    where = f" / {selected_city}" if selected_city else ""
+    await q.edit_message_text(
+        "📚 CATÁLOGO\n\n"
+        f"Paso 3/3 — {platform}{where}\n"
+        f"Encontrados: {len(results)}\n\n"
+        "Te envío tarjetas (hasta 10)."
+    )
+
+    shown = 0
+    for g, owner in results:
+        text = (
+            f"🎮 {g.get('title','')}\n"
+            f"📱 {g.get('platform','')}  |  ⭐ {g.get('condition','')}\n"
+            f"🔄 Busca: {g.get('looking_for','')}\n"
+            f"👤 Dueño: {owner.get('display_name','Usuario')} ({owner.get('city','')})\n"
+            f"⭐ {float(owner.get('rating') or 0.0):.1f}/5.0  ({int(owner.get('total_swaps') or 0)} intercambios)\n"
+        )
+        markup = user_contact_button(owner, "💬 Escribir al dueño")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=markup)
+
+        shown += 1
+        if shown >= 10:
+            break
+
+    if len(results) > shown:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"… y {len(results) - shown} más. Usa /search para buscar por nombre.",
+        )
+
+    return ConversationHandler.END
 
 
 # ============================
@@ -747,6 +958,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mygames — ver mis juegos\n"
         "/add — añadir juego\n"
         "/search — buscar juego\n"
+        "/catalog — catálogo (por filtros)\n"
         "/swap — confirmar intercambio"
     )
 
@@ -821,9 +1033,8 @@ async def swap_input_other_title(update: Update, context: ContextTypes.DEFAULT_T
     my_id = int(update.effective_user.id)
     context.user_data["swap_other_title"] = q
 
-    results = db.search_games(q)
-    # убираем свои игры
-    results = [g for g in results if int(g["user_id"]) != my_id]
+    results = db.search_games(q) or []
+    results = [g for g in results if int(g.get("user_id") or 0) != my_id]
 
     if not results:
         await update.message.reply_text(
@@ -842,7 +1053,7 @@ async def swap_input_other_title(update: Update, context: ContextTypes.DEFAULT_T
         owner_name = owner.get("display_name", "Usuario")
         city = owner.get("city", "")
         btn = f"{g['title']} | {g['platform']} | {owner_name} {('('+city+')') if city else ''}"
-        kb.append([InlineKeyboardButton(btn[:60], callback_data=f"swap_take:{int(g['game_id'])}")])
+        kb.append([InlineKeyboardButton(_short_btn(btn, 60), callback_data=f"swap_take:{int(g['game_id'])}")])
 
         shown += 1
         if shown >= 10:
@@ -1035,7 +1246,6 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("Failed to notify initiator after swap completion")
 
-    # publish completed
     try:
         g1 = db.get_game(int(swap["game1_id"]))
         g2 = db.get_game(int(swap["game2_id"]))
@@ -1054,7 +1264,6 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("Failed to publish swap completion")
 
-    # start feedback for both
     await start_feedback_for_user(
         context=context,
         rater_user_id=int(swap["user1_id"]),
@@ -1112,7 +1321,6 @@ async def fb_stars_or_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stars = int(parts[3])
     key = _fb_key(swap_id, rater_user_id, ratee_user_id)
 
-    # Храним сессию в user_data (а не chat_data), чтобы не было конфликтов
     context.user_data[key] = {
         "swap_id": swap_id,
         "from_user_id": rater_user_id,
@@ -1488,7 +1696,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/add       — añadir juego\n"
         "/mygames   — mis juegos\n"
         "/search    — buscar juego\n"
-        "/catalog   — catálogo completo\n"
+        "/catalog   — catálogo (por filtros)\n"
         "/profile   — mi perfil\n"
         "/swap      — confirmar intercambio\n"
         "/help      — esta ayuda\n\n"
@@ -1560,6 +1768,15 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    catalog_handler = ConversationHandler(
+        entry_points=[CommandHandler("catalog", catalog_start)],
+        states={
+            CATALOG_PLATFORM: [CallbackQueryHandler(catalog_choose_platform, pattern="^(cat_plat:|cat_cancel$)")],
+            CATALOG_CITY: [CallbackQueryHandler(catalog_choose_city, pattern="^(cat_city:|cat_back_platform$|cat_cancel$)")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     swap_handler = ConversationHandler(
         entry_points=[CommandHandler("swap", swap_start)],
         states={
@@ -1594,10 +1811,10 @@ def main():
     application.add_handler(registration_handler)
     application.add_handler(add_game_handler)
     application.add_handler(search_handler)
+    application.add_handler(catalog_handler)
     application.add_handler(swap_handler)
 
     application.add_handler(CommandHandler("mygames", my_games))
-    application.add_handler(CommandHandler("catalog", catalog))
     application.add_handler(CommandHandler("profile", profile))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stats", stats))
