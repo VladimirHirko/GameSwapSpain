@@ -611,7 +611,6 @@ async def swap_input_other_username(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("❌ Escribe un @username válido. Ejemplo: @pepe_gamer")
         return SWAP_INPUT_OTHER_USERNAME
 
-    # exact match
     other = db.get_user_by_username(u)
     if other and int(other["user_id"]) == int(user_id):
         await update.message.reply_text("❌ No puedes intercambiar contigo mismo. Escribe el @username del otro usuario.")
@@ -621,7 +620,6 @@ async def swap_input_other_username(update: Update, context: ContextTypes.DEFAUL
         context.user_data["swap_other_user_id"] = int(other["user_id"])
         return await _swap_show_other_user_games(update, context, int(other["user_id"]))
 
-    # suggestions (LIKE)
     suggestions = db.search_users_by_username(u, limit=10)
     suggestions = [s for s in suggestions if int(s["user_id"]) != int(user_id)]
 
@@ -637,7 +635,14 @@ async def swap_input_other_username(update: Update, context: ContextTypes.DEFAUL
 
     kb = []
     for s in suggestions:
-        kb.append([InlineKeyboardButton(f"@{s['username']} ({s.get('city','')})", callback_data=f"swap_userpick:{int(s['user_id'])}")])
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    f"@{s['username']} ({s.get('city','')})",
+                    callback_data=f"swap_userpick:{int(s['user_id'])}",
+                )
+            ]
+        )
     kb.append([InlineKeyboardButton("❌ Cancelar", callback_data="swap_cancel_flow")])
 
     await update.message.reply_text(
@@ -663,38 +668,33 @@ async def swap_pick_user_from_suggestions(update: Update, context: ContextTypes.
         return ConversationHandler.END
 
     context.user_data["swap_other_user_id"] = other_user_id
-
     other = db.get_user(other_user_id)
     if not other:
         await query.edit_message_text("❌ Usuario no encontrado.")
         return ConversationHandler.END
 
-    # Show games as a new message (easier than edit with huge keyboards)
     try:
         await query.edit_message_text(f"✅ Usuario seleccionado: @{other['username']}\n\nCargando sus juegos…")
     except Exception:
         pass
 
-    # Reuse helper
-    fake_update = update
-    return await _swap_show_other_user_games(fake_update, context, other_user_id)
+    return await _swap_show_other_user_games(update, context, other_user_id)
 
 
 async def _swap_show_other_user_games(update: Update, context: ContextTypes.DEFAULT_TYPE, other_user_id: int):
-    """Send list of other user's active games as buttons."""
     offered_game_id = context.user_data.get("swap_offered_game_id")
     if not offered_game_id:
-        await update.message.reply_text("❌ Sesión caducada. Empieza de nuevo: /swap")
+        await update.effective_chat.send_message("❌ Sesión caducada. Empieza de nuevo: /swap")
         return ConversationHandler.END
 
     other_user = db.get_user(other_user_id)
     if not other_user:
-        await update.message.reply_text("❌ Usuario no encontrado.")
+        await update.effective_chat.send_message("❌ Usuario no encontrado.")
         return ConversationHandler.END
 
     games = db.get_user_active_games(other_user_id, limit=50)
     if not games:
-        await update.message.reply_text(f"📦 @{other_user['username']} no tiene juegos activos en el catálogo.")
+        await update.effective_chat.send_message(f"📦 @{other_user['username']} no tiene juegos activos en el catálogo.")
         return SWAP_INPUT_OTHER_USERNAME
 
     keyboard = []
@@ -857,7 +857,10 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
         db.set_swap_status(swap_id, "rejected")
         await query.edit_message_text("❌ Has rechazado el intercambio.")
         try:
-            await context.bot.send_message(chat_id=int(swap["user1_id"]), text="❌ Tu solicitud de intercambio fue rechazada.")
+            await context.bot.send_message(
+                chat_id=int(swap["user1_id"]),
+                text="❌ Tu solicitud de intercambio fue rechazada.",
+            )
         except Exception:
             logger.exception("Failed to notify initiator about rejection")
         return
@@ -896,7 +899,7 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("Failed to publish swap completion")
 
-    # Start feedback flow for BOTH users
+    # Start feedback for both
     await start_feedback_for_user(
         context=context,
         rater_user_id=int(swap["user1_id"]),
@@ -915,7 +918,10 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
 # FEEDBACK FLOW
 # ============================
 async def start_feedback_for_user(
-    context: ContextTypes.DEFAULT_TYPE, rater_user_id: int, ratee_user_id: int, swap_id: int
+    context: ContextTypes.DEFAULT_TYPE,
+    rater_user_id: int,
+    ratee_user_id: int,
+    swap_id: int,
 ):
     ratee = db.get_user(ratee_user_id) or {"username": "SinUsuario"}
     text = (
@@ -935,7 +941,7 @@ async def fb_stars_or_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     parts = query.data.split(":")
-    action = parts[0]  # fb_stars or fb_skip
+    action = parts[0]
     swap_id = int(parts[1])
     ratee_user_id = int(parts[2])
     rater_user_id = int(update.effective_user.id)
@@ -1039,7 +1045,6 @@ async def fb_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.chat_data.pop(key, None)
     context.chat_data.pop("fb_active_key", None)
-
     return ConversationHandler.END
 
 
@@ -1147,7 +1152,9 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, swap_input_other_username),
                 CallbackQueryHandler(swap_pick_user_from_suggestions, pattern="^(swap_userpick:|swap_cancel_flow$)"),
             ],
-            SWAP_SELECT_OTHER_GAME: [CallbackQueryHandler(swap_select_other_game, pattern="^(swap_take:|swap_cancel_flow$)")],
+            SWAP_SELECT_OTHER_GAME: [
+                CallbackQueryHandler(swap_select_other_game, pattern="^(swap_take:|swap_cancel_flow$)")
+            ],
             SWAP_CONFIRM: [CallbackQueryHandler(swap_confirm, pattern="^(swap_send|swap_cancel)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1183,7 +1190,6 @@ def main():
     application.add_handler(CommandHandler("stats", stats))
 
     application.add_handler(CallbackQueryHandler(swap_accept_or_reject, pattern="^(swap_accept|swap_reject):"))
-
     application.add_handler(feedback_handler)
 
     logger.info("🤖 Bot iniciado (polling)")

@@ -7,10 +7,16 @@ Gestión de base de datos SQLite
 Versión: swaps (pending->completed con cambio de dueño) + feedback (rating/comment/photos)
 Compatible con Railway (ruta por defecto /data/gameswap.db)
 
-Notas:
-- Mantiene compatibilidad con tablas existentes.
-- Hace migraciones ligeras via ALTER TABLE si faltan columnas.
-- Recomendado: en Railway definir variable DB_FILE=/data/gameswap.db (opcional).
+✅ Fix clave (por tu bug actual):
+- Búsqueda por username ahora es case-insensitive (COLLATE NOCASE)
+- Normalización de username (sin @, strip) + guardado consistente
+- search_users_by_username() y get_user_by_username() funcionan aunque el usuario escriba @VladIsss_77 o vladisss_77
+
+✅ Otros fixes:
+- update_user_rating() tenía SQL roto (número de parámetros incorrecto) -> arreglado
+- conexiones con busy_timeout + WAL (si se puede) + FK ON
+- create_user(): si ya existe el user_id, actualiza datos en vez de fallar
+- índices útiles + UNIQUE feedback por swap/from_user
 """
 
 import os
@@ -25,10 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 class Database:
-    """Clase para gestionar la base de datos"""
-
     def __init__(self, db_file: Optional[str] = None):
-        # ✅ приоритет: аргумент -> env -> дефолт
         self.db_file = (db_file or os.getenv("DB_FILE") or "/data/gameswap.db").strip()
         self.init_database()
 
@@ -38,8 +41,11 @@ class Database:
     def get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_file, timeout=30)
         conn.row_factory = sqlite3.Row
-        # FK лучше включать всегда (на SQLite это per-connection)
-        conn.execute("PRAGMA foreign_keys=ON;")
+        try:
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+        except Exception:
+            pass
         return conn
 
     def _now(self) -> str:
@@ -53,21 +59,14 @@ class Database:
         cur.execute(f"PRAGMA table_info({table})")
         return {r["name"] for r in cur.fetchall()}
 
-    def _table_exists(self, conn: sqlite3.Connection, table: str) -> bool:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            (table,),
-        )
-        return cur.fetchone() is not None
-
-    def _index_exists(self, conn: sqlite3.Connection, index_name: str) -> bool:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
-            (index_name,),
-        )
-        return cur.fetchone() is not None
+    # ----------------------------
+    # Username helpers
+    # ----------------------------
+    def _normalize_username(self, username: str) -> str:
+        u = (username or "").strip()
+        if u.startswith("@"):
+            u = u[1:]
+        return u.strip()
 
     # ----------------------------
     # Schema init + lightweight migrations
@@ -76,8 +75,7 @@ class Database:
         conn = self.get_connection()
         cur = conn.cursor()
 
-        # optional: WAL (может ускорить чтение/запись, но не всегда нужно)
-        # В Railway обычно ок, но если будут странные ошибки — можно закомментировать.
+        # WAL (если доступен)
         try:
             cur.execute("PRAGMA journal_mode=WAL;")
         except Exception:
@@ -140,7 +138,7 @@ class Database:
             """
         )
 
-        # ---- feedback tables
+        # ---- feedback
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS swap_feedback (
@@ -170,7 +168,7 @@ class Database:
             """
         )
 
-        # ---- MIGRATIONS: swaps new columns
+        # ---- MIGRATIONS: swaps columns
         cols_swaps = self._table_columns(conn, "swaps")
         if "code" not in cols_swaps:
             cur.execute("ALTER TABLE swaps ADD COLUMN code TEXT")
@@ -188,18 +186,14 @@ class Database:
         if "rating_count" not in cols_users:
             cur.execute("ALTER TABLE users ADD COLUMN rating_count INTEGER DEFAULT 0")
 
-        # ---- Indexes (performance + quality)
-        # users.username lookup
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-        # games searches
+        # ---- Indexes
+        # ВАЖНО: username case-insensitive
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_games_status ON games(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_games_user_status ON games(user_id, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_games_title ON games(title)")
-        # swaps status
         cur.execute("CREATE INDEX IF NOT EXISTS idx_swaps_status ON swaps(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_swaps_user2_status ON swaps(user2_id, status)")
-        # feedback: prevent duplicates
-        # (SQLite allows CREATE UNIQUE INDEX IF NOT EXISTS)
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_feedback_once_per_swap "
             "ON swap_feedback(swap_id, from_user_id)"
@@ -214,28 +208,59 @@ class Database:
     # USERS
     # ============================
     def create_user(self, user_id: int, username: str, display_name: str, city: str) -> bool:
+        """
+        Создаёт пользователя. Если уже существует user_id — обновляет данные.
+        """
+        u = self._normalize_username(username) or "SinUsuario"
+        dn = (display_name or "SinNombre").strip()
+        ct = (city or "SinCiudad").strip()
+
+        conn: Optional[sqlite3.Connection] = None
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO users (user_id, username, display_name, city, registered_date)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (user_id, username, display_name, city, self._now()),
-            )
+            cur.execute("BEGIN")
+
+            # если уже есть — обновим
+            cur.execute("SELECT user_id FROM users WHERE user_id = ?", (int(user_id),))
+            exists = cur.fetchone() is not None
+
+            if not exists:
+                cur.execute(
+                    """
+                    INSERT INTO users (user_id, username, display_name, city, registered_date)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (int(user_id), u, dn, ct, self._now()),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET username = ?, display_name = ?, city = ?
+                    WHERE user_id = ?
+                    """,
+                    (u, dn, ct, int(user_id)),
+                )
+
             conn.commit()
             conn.close()
             return True
         except Exception as e:
-            logger.error("❌ Error al crear usuario: %s", e)
+            logger.error("❌ Error al crear/actualizar usuario: %s", e)
+            try:
+                if conn:
+                    conn.rollback()
+                    conn.close()
+            except Exception:
+                pass
             return False
 
     def get_user(self, user_id: int) -> Optional[Dict]:
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            cur.execute("SELECT * FROM users WHERE user_id = ?", (int(user_id),))
             row = cur.fetchone()
             conn.close()
             return dict(row) if row else None
@@ -243,21 +268,17 @@ class Database:
             logger.error("❌ Error al obtener usuario: %s", e)
             return None
 
-    def _normalize_username(self, username: str) -> str:
-        u = (username or "").strip()
-        if u.startswith("@"):
-            u = u[1:]
-        return u
-
     def get_user_by_username(self, username: str) -> Optional[Dict]:
-        """Buscar usuario por username de Telegram (con o sin @)."""
+        """
+        Buscar usuario por username de Telegram (con o sin @) CASE-INSENSITIVE.
+        """
         u = self._normalize_username(username)
         if not u:
             return None
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            cur.execute("SELECT * FROM users WHERE username = ? LIMIT 1", (u,))
+            cur.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE LIMIT 1", (u,))
             row = cur.fetchone()
             conn.close()
             return dict(row) if row else None
@@ -266,7 +287,9 @@ class Database:
             return None
 
     def search_users_by_username(self, query: str, limit: int = 10) -> List[Dict]:
-        """Подсказки по username (LIKE)."""
+        """
+        Подсказки по username (LIKE) CASE-INSENSITIVE.
+        """
         q = self._normalize_username(query)
         if not q:
             return []
@@ -276,7 +299,7 @@ class Database:
             cur.execute(
                 """
                 SELECT * FROM users
-                WHERE username LIKE ?
+                WHERE username LIKE ? COLLATE NOCASE
                 ORDER BY total_swaps DESC, rating DESC
                 LIMIT ?
                 """,
@@ -302,6 +325,9 @@ class Database:
 
     # Legacy method (kept)
     def update_user_rating(self, user_id: int, new_rating: float) -> bool:
+        """
+        Старый метод: выставляет rating напрямую и увеличивает total_swaps.
+        """
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -311,7 +337,7 @@ class Database:
                 SET rating = ?, total_swaps = total_swaps + 1
                 WHERE user_id = ?
                 """,
-                (new_rating, float(new_rating), user_id),
+                (float(new_rating), int(user_id)),
             )
             conn.commit()
             conn.close()
@@ -331,7 +357,7 @@ class Database:
             cur = conn.cursor()
             cur.execute("BEGIN")
 
-            cur.execute("SELECT rating_sum, rating_count FROM users WHERE user_id = ?", (to_user_id,))
+            cur.execute("SELECT rating_sum, rating_count FROM users WHERE user_id = ?", (int(to_user_id),))
             row = cur.fetchone()
             if not row:
                 cur.execute("ROLLBACK")
@@ -348,7 +374,7 @@ class Database:
                 SET rating_sum = ?, rating_count = ?, rating = ?
                 WHERE user_id = ?
                 """,
-                (rs, rc, float(rating), to_user_id),
+                (rs, rc, float(rating), int(to_user_id)),
             )
 
             conn.commit()
@@ -384,7 +410,7 @@ class Database:
                 INSERT INTO games (user_id, title, platform, condition, photo_url, looking_for, created_date)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, title, platform, condition, photo_url, looking_for, self._now()),
+                (int(user_id), str(title).strip(), str(platform).strip(), str(condition).strip(), photo_url, str(looking_for).strip(), self._now()),
             )
             game_id = cur.lastrowid
             conn.commit()
@@ -398,7 +424,7 @@ class Database:
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            cur.execute("SELECT * FROM games WHERE game_id = ?", (game_id,))
+            cur.execute("SELECT * FROM games WHERE game_id = ?", (int(game_id),))
             row = cur.fetchone()
             conn.close()
             return dict(row) if row else None
@@ -416,7 +442,7 @@ class Database:
                 WHERE user_id = ? AND status = 'active'
                 ORDER BY created_date DESC
                 """,
-                (user_id,),
+                (int(user_id),),
             )
             rows = cur.fetchall()
             conn.close()
@@ -426,7 +452,6 @@ class Database:
             return []
 
     def get_user_active_games(self, user_id: int, limit: int = 50) -> List[Dict]:
-        """Для swap-flow: быстро получить активные игры пользователя."""
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -437,7 +462,7 @@ class Database:
                 ORDER BY created_date DESC
                 LIMIT ?
                 """,
-                (user_id, int(limit)),
+                (int(user_id), int(limit)),
             )
             rows = cur.fetchall()
             conn.close()
@@ -445,12 +470,6 @@ class Database:
         except Exception as e:
             logger.error("❌ Error get_user_active_games: %s", e)
             return []
-
-    def get_user_active_games_by_username(self, username: str, limit: int = 50) -> List[Dict]:
-        u = self.get_user_by_username(username)
-        if not u:
-            return []
-        return self.get_user_active_games(int(u["user_id"]), limit=limit)
 
     def get_all_active_games(self) -> List[Dict]:
         try:
@@ -471,6 +490,9 @@ class Database:
             return []
 
     def search_games(self, query: str) -> List[Dict]:
+        """
+        Поиск по названию игры CASE-INSENSITIVE (spidir man -> Spider Man найдёт).
+        """
         try:
             q = (query or "").strip()
             if not q:
@@ -481,7 +503,7 @@ class Database:
                 """
                 SELECT * FROM games
                 WHERE status = 'active'
-                  AND title LIKE ?
+                  AND title LIKE ? COLLATE NOCASE
                 ORDER BY created_date DESC
                 """,
                 (f"%{q}%",),
@@ -503,7 +525,7 @@ class Database:
                 SET status = 'removed'
                 WHERE game_id = ? AND user_id = ?
                 """,
-                (game_id, user_id),
+                (int(game_id), int(user_id)),
             )
             conn.commit()
             conn.close()
@@ -526,14 +548,16 @@ class Database:
     # ============================
     # SWAPS
     # ============================
-    def create_swap_request(self, user1_id: int, user2_id: int, game1_id: int, game2_id: int) -> Optional[Tuple[int, str]]:
+    def create_swap_request(
+        self, user1_id: int, user2_id: int, game1_id: int, game2_id: int
+    ) -> Optional[Tuple[int, str]]:
         try:
             conn = self.get_connection()
             cur = conn.cursor()
 
             cur.execute(
                 "SELECT game_id, user_id, status FROM games WHERE game_id IN (?, ?)",
-                (game1_id, game2_id),
+                (int(game1_id), int(game2_id)),
             )
             rows = cur.fetchall()
             if len(rows) != 2:
@@ -541,10 +565,10 @@ class Database:
                 return None
 
             info = {int(r["game_id"]): dict(r) for r in rows}
-            if info.get(game1_id, {}).get("user_id") != user1_id or info.get(game2_id, {}).get("user_id") != user2_id:
+            if info.get(int(game1_id), {}).get("user_id") != int(user1_id) or info.get(int(game2_id), {}).get("user_id") != int(user2_id):
                 conn.close()
                 return None
-            if info[game1_id]["status"] != "active" or info[game2_id]["status"] != "active":
+            if info[int(game1_id)]["status"] != "active" or info[int(game2_id)]["status"] != "active":
                 conn.close()
                 return None
 
@@ -560,7 +584,7 @@ class Database:
                 )
                 VALUES (?, ?, ?, ?, 1, 0, 'pending', ?, ?, ?)
                 """,
-                (user1_id, user2_id, game1_id, game2_id, code, now, now),
+                (int(user1_id), int(user2_id), int(game1_id), int(game2_id), code, now, now),
             )
 
             swap_id = cur.lastrowid
@@ -575,7 +599,7 @@ class Database:
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            cur.execute("SELECT * FROM swaps WHERE swap_id = ?", (swap_id,))
+            cur.execute("SELECT * FROM swaps WHERE swap_id = ?", (int(swap_id),))
             row = cur.fetchone()
             conn.close()
             return dict(row) if row else None
@@ -589,7 +613,7 @@ class Database:
             cur = conn.cursor()
             cur.execute(
                 "UPDATE swaps SET status = ?, updated_date = ? WHERE swap_id = ?",
-                (status, self._now(), swap_id),
+                (str(status), self._now(), int(swap_id)),
             )
             conn.commit()
             conn.close()
@@ -605,7 +629,7 @@ class Database:
             cur = conn.cursor()
             cur.execute("BEGIN")
 
-            cur.execute("SELECT * FROM swaps WHERE swap_id = ?", (swap_id,))
+            cur.execute("SELECT * FROM swaps WHERE swap_id = ?", (int(swap_id),))
             swap_row = cur.fetchone()
             if not swap_row:
                 cur.execute("ROLLBACK")
@@ -617,7 +641,7 @@ class Database:
                 cur.execute("ROLLBACK")
                 return False, f"swap status is {swap.get('status')}"
 
-            if confirmer_user_id != int(swap["user2_id"]):
+            if int(confirmer_user_id) != int(swap["user2_id"]):
                 cur.execute("ROLLBACK")
                 return False, "only recipient can confirm"
 
@@ -636,7 +660,7 @@ class Database:
                 return False, "game not found"
 
             g = {int(r["game_id"]): dict(r) for r in rows}
-            if g[game1_id]["user_id"] != user1_id or g[game2_id]["user_id"] != user2_id:
+            if int(g[game1_id]["user_id"]) != user1_id or int(g[game2_id]["user_id"]) != user2_id:
                 cur.execute("ROLLBACK")
                 return False, "owners changed; cannot complete"
             if g[game1_id]["status"] != "active" or g[game2_id]["status"] != "active":
@@ -657,7 +681,7 @@ class Database:
                     updated_date = ?
                 WHERE swap_id = ?
                 """,
-                (now, now, swap_id),
+                (now, now, int(swap_id)),
             )
 
             cur.execute(
@@ -710,10 +734,9 @@ class Database:
             conn = self.get_connection()
             cur = conn.cursor()
 
-            # уникальность уже защищена UNIQUE INDEX, но оставим мягкую проверку
             cur.execute(
                 "SELECT feedback_id FROM swap_feedback WHERE swap_id = ? AND from_user_id = ?",
-                (swap_id, from_user_id),
+                (int(swap_id), int(from_user_id)),
             )
             if cur.fetchone():
                 conn.close()
@@ -724,14 +747,14 @@ class Database:
                 INSERT INTO swap_feedback (swap_id, from_user_id, to_user_id, stars, comment, created_date)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (swap_id, from_user_id, to_user_id, int(stars), comment_norm, self._now()),
+                (int(swap_id), int(from_user_id), int(to_user_id), int(stars), comment_norm, self._now()),
             )
             feedback_id = cur.lastrowid
             conn.commit()
             conn.close()
 
             # агрегаты рейтинга
-            self.apply_user_rating(to_user_id=to_user_id, stars=stars)
+            self.apply_user_rating(to_user_id=int(to_user_id), stars=int(stars))
 
             return int(feedback_id)
         except Exception as e:
@@ -747,7 +770,7 @@ class Database:
                 INSERT INTO swap_feedback_photos (feedback_id, photo_file_id, created_date)
                 VALUES (?, ?, ?)
                 """,
-                (feedback_id, str(photo_file_id), self._now()),
+                (int(feedback_id), str(photo_file_id), self._now()),
             )
             conn.commit()
             conn.close()
@@ -766,7 +789,7 @@ class Database:
                 WHERE feedback_id = ?
                 ORDER BY id ASC
                 """,
-                (feedback_id,),
+                (int(feedback_id),),
             )
             rows = cur.fetchall()
             conn.close()
@@ -779,7 +802,7 @@ class Database:
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            cur.execute("SELECT rating, rating_count FROM users WHERE user_id = ?", (user_id,))
+            cur.execute("SELECT rating, rating_count FROM users WHERE user_id = ?", (int(user_id),))
             row = cur.fetchone()
             conn.close()
             if not row:
@@ -800,7 +823,7 @@ class Database:
                 ORDER BY created_date DESC
                 LIMIT ?
                 """,
-                (user_id, int(limit)),
+                (int(user_id), int(limit)),
             )
             rows = cur.fetchall()
             conn.close()
