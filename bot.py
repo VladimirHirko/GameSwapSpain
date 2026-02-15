@@ -4,24 +4,27 @@
 GameSwap Spain Bot
 Bot para intercambio de juegos entre gamers
 
-Версия (исправленная):
+Версия (актуальная):
 - Регистрация + добавление игр + поиск + каталог + профиль
 - Контакт владельца ВСЕГДА через tg://user?id=<user_id> (работает без @username)
-- Swap: выбираем свою игру -> вводим название полученной игры -> выбираем ТОЧНУЮ карточку (игра+владелец) -> отправляем запрос
-  ✅ Это решает ситуацию, когда одна и та же игра есть у нескольких пользователей
-  ✅ Не требуется @username вообще
-
-Feedback (rating + comment + photos) tras swap completado
-ADMIN minimal + Ban guard — как было
+- Swap (новый поток, без @username):
+  1) выбираем свою игру
+  2) вводим название полученной игры
+  3) выбираем ТОЧНУЮ карточку (игра + владелец)
+  4) отправляем запрос
+- Feedback (rating + comment + photos) после swap completed
+- ADMIN minimal + Ban guard
 
 ВАЖНО:
-- Удали старый swap-поток по @username (в этой версии его нет).
+- Старый swap-поток по @username здесь отсутствует.
 """
 
 import os
 import logging
 import html
 from datetime import datetime
+from typing import Optional, Union
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -75,14 +78,14 @@ db = Database()
 # ----------------------------
 # Helpers
 # ----------------------------
-def env(name: str) -> str | None:
+def env(name: str) -> Optional[str]:
     v = os.getenv(name)
     if not v:
         return None
     return v.strip().strip('"').strip("'")
 
 
-def publish_target_chat_id() -> str | int | None:
+def publish_target_chat_id() -> Optional[Union[str, int]]:
     v = env("CHANNEL_CHAT_ID") or env("GROUP_CHAT_ID")
     if not v:
         return None
@@ -92,7 +95,12 @@ def publish_target_chat_id() -> str | int | None:
         return v
 
 
-async def safe_publish_text(context: ContextTypes.DEFAULT_TYPE, text: str, *, parse_mode: str | None = None) -> None:
+async def safe_publish_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode: Optional[str] = None,
+) -> None:
     chat_id = publish_target_chat_id()
     if not chat_id:
         logger.warning("Publish skipped: CHANNEL_CHAT_ID/GROUP_CHAT_ID not set")
@@ -108,7 +116,13 @@ async def safe_publish_text(context: ContextTypes.DEFAULT_TYPE, text: str, *, pa
         logger.exception("Failed to publish text to %r", chat_id)
 
 
-async def safe_publish_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_id: str, caption: str, *, parse_mode: str | None = None) -> None:
+async def safe_publish_photo(
+    context: ContextTypes.DEFAULT_TYPE,
+    photo_file_id: str,
+    caption: str,
+    *,
+    parse_mode: Optional[str] = None,
+) -> None:
     chat_id = publish_target_chat_id()
     if not chat_id:
         logger.warning("Publish skipped: CHANNEL_CHAT_ID/GROUP_CHAT_ID not set")
@@ -147,7 +161,7 @@ def user_label(u: dict) -> str:
     return (u.get("display_name") or "Usuario").strip()
 
 
-def user_contact_url(u: dict) -> str | None:
+def user_contact_url(u: dict) -> Optional[str]:
     """
     Универсальная ссылка для контакта, работает даже без username.
     """
@@ -160,7 +174,7 @@ def user_contact_url(u: dict) -> str | None:
         return None
 
 
-def user_contact_button(u: dict, label: str = "💬 Escribir al dueño") -> InlineKeyboardMarkup | None:
+def user_contact_button(u: dict, label: str = "💬 Escribir al dueño") -> Optional[InlineKeyboardMarkup]:
     url = user_contact_url(u)
     if not url:
         return None
@@ -172,8 +186,9 @@ def stars_label(n: int) -> str:
     return "⭐" * n + "☆" * (5 - n)
 
 
-def _fb_key(swap_id: int, to_user_id: int) -> str:
-    return f"fb:{int(swap_id)}:{int(to_user_id)}"
+def _fb_key(swap_id: int, from_user_id: int, to_user_id: int) -> str:
+    # ключ делаем уникальным на пользователя-оценщика тоже
+    return f"fb:{int(swap_id)}:{int(from_user_id)}:{int(to_user_id)}"
 
 
 # ----------------------------
@@ -283,6 +298,9 @@ async def _admin_render_users_page(update: Update, context: ContextTypes.DEFAULT
 # MAIN COMMANDS
 # ============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     user_id = update.effective_user.id
     user = db.get_user(user_id)
 
@@ -305,7 +323,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🎮 ¡Hola! Bienvenid@ a GameSwap Spain\n\n"
-        "Aquí puedes intercambiar juegos físicos con otros jugadores sin gastar dinero.\n\n"
+        "Aquí puedes intercambiar juegos físicos con otros jugadores.\n\n"
         "📝 ¡Vamos a registrarte!\n\n"
         "¿Cómo te llamas? (o escribe tu nick)"
     )
@@ -313,6 +331,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def registration_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     context.user_data["display_name"] = (update.message.text or "").strip()
 
     keyboard = [
@@ -332,6 +353,9 @@ async def registration_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     city = (update.message.text or "").strip()
 
     if city == "Otra ciudad 📝":
@@ -339,7 +363,7 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return REGISTRATION_CITY
 
     user_id = update.effective_user.id
-    username = update.effective_user.username or ""  # пустая строка, если нет
+    username = update.effective_user.username or ""
     display_name = context.user_data.get("display_name", "SinNombre")
 
     db.create_user(user_id, username, display_name, city)
@@ -373,10 +397,16 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("❌ Operación cancelada.", reply_markup=ReplyKeyboardRemove())
+
+    # чистим swap session
     context.user_data.pop("swap_offered_game_id", None)
     context.user_data.pop("swap_other_user_id", None)
     context.user_data.pop("swap_requested_game_id", None)
     context.user_data.pop("swap_other_title", None)
+
+    # чистим feedback session
+    context.user_data.pop("fb_active_key", None)
+
     return ConversationHandler.END
 
 
@@ -474,6 +504,7 @@ async def add_game_condition(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def add_game_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /skip
     if update.message and update.message.text and update.message.text.strip().lower() in {"/skip", "skip"}:
         context.user_data["game_photo"] = None
     elif update.message and update.message.photo:
@@ -566,13 +597,15 @@ async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = f"🎮 TUS JUEGOS ({len(games)}):\n\n"
     for i, game in enumerate(games, 1):
         message += (
-            f"✅ {i}. {game['title']}\n"
+            f"✅ {i}. #{game['game_id']} — {game['title']}\n"
             f"   📱 {game['platform']}  |  ⭐ {game['condition']}\n"
             f"   🔄 Busco: {game['looking_for']}\n"
             f"   📅 Añadido: {str(game['created_date'])[:10]}\n\n"
         )
 
-    message += "Para eliminar un juego escribe:\n/remove [número]"
+    # ВАЖНО: мы не знаем твой точный метод удаления в database.py,
+    # поэтому не обещаем /remove (чтобы не ломать UX).
+    message += "ℹ️ Para eliminar: usa los comandos ADMIN o añade un método de borrado en database.py."
     await update.message.reply_text(message)
 
 
@@ -673,7 +706,7 @@ async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message += f"   … y otros {len(games_list) - 5}\n"
         message += "\n"
 
-    message += "Para buscar un juego concreto usa:\n/search [nombre]\n"
+    message += "Para buscar un juego concreto usa:\n/search\n"
     await update.message.reply_text(message)
 
 
@@ -749,6 +782,9 @@ async def swap_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def swap_select_own(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -774,6 +810,9 @@ async def swap_select_own(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def swap_input_other_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     q = (update.message.text or "").strip()
     if not q:
         await update.message.reply_text("❌ Escribe un nombre de juego o /cancel.")
@@ -800,7 +839,6 @@ async def swap_input_other_title(update: Update, context: ContextTypes.DEFAULT_T
         if not owner:
             continue
 
-        # Укорачиваем подпись кнопки, чтобы Telegram не ругался
         owner_name = owner.get("display_name", "Usuario")
         city = owner.get("city", "")
         btn = f"{g['title']} | {g['platform']} | {owner_name} {('('+city+')') if city else ''}"
@@ -820,6 +858,9 @@ async def swap_input_other_title(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def swap_select_other_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -872,6 +913,9 @@ async def swap_select_other_game(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -941,6 +985,9 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Swap accept/reject callbacks
 # ----------------------------
 async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return
+
     query = update.callback_query
     await query.answer()
 
@@ -988,6 +1035,7 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("Failed to notify initiator after swap completion")
 
+    # publish completed
     try:
         g1 = db.get_game(int(swap["game1_id"]))
         g2 = db.get_game(int(swap["game2_id"]))
@@ -1006,6 +1054,7 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("Failed to publish swap completion")
 
+    # start feedback for both
     await start_feedback_for_user(
         context=context,
         rater_user_id=int(swap["user1_id"]),
@@ -1036,13 +1085,17 @@ async def start_feedback_for_user(
         "Elige estrellas:"
     )
     kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(stars_label(i), callback_data=f"fb_stars:{swap_id}:{ratee_user_id}:{i}")] for i in range(5, 0, -1)]
+        [[InlineKeyboardButton(stars_label(i), callback_data=f"fb_stars:{swap_id}:{ratee_user_id}:{i}")]
+         for i in range(5, 0, -1)]
         + [[InlineKeyboardButton("Omitir", callback_data=f"fb_skip:{swap_id}:{ratee_user_id}")]]
     )
     await context.bot.send_message(chat_id=rater_user_id, text=text, reply_markup=kb)
 
 
 async def fb_stars_or_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -1057,9 +1110,10 @@ async def fb_stars_or_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     stars = int(parts[3])
-    key = _fb_key(swap_id, ratee_user_id)
+    key = _fb_key(swap_id, rater_user_id, ratee_user_id)
 
-    context.chat_data[key] = {
+    # Храним сессию в user_data (а не chat_data), чтобы не было конфликтов
+    context.user_data[key] = {
         "swap_id": swap_id,
         "from_user_id": rater_user_id,
         "to_user_id": ratee_user_id,
@@ -1067,7 +1121,7 @@ async def fb_stars_or_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "comment": None,
         "photos": [],
     }
-    context.chat_data["fb_active_key"] = key
+    context.user_data["fb_active_key"] = key
 
     await query.edit_message_text(
         f"⭐ Has elegido: {stars_label(stars)}\n\n"
@@ -1077,16 +1131,19 @@ async def fb_stars_or_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def fb_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = context.chat_data.get("fb_active_key")
-    if not key or key not in context.chat_data:
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
+    key = context.user_data.get("fb_active_key")
+    if not key or key not in context.user_data:
         await update.message.reply_text("❌ Sesión de valoración caducada.")
         return ConversationHandler.END
 
     text = (update.message.text or "").strip()
     if text.lower() in {"/skip", "skip"}:
-        context.chat_data[key]["comment"] = None
+        context.user_data[key]["comment"] = None
     else:
-        context.chat_data[key]["comment"] = text[:800]
+        context.user_data[key]["comment"] = text[:800]
 
     await update.message.reply_text(
         "📸 Puedes enviar hasta 3 fotos como prueba (una por mensaje).\n"
@@ -1097,12 +1154,15 @@ async def fb_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def fb_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = context.chat_data.get("fb_active_key")
-    if not key or key not in context.chat_data:
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
+    key = context.user_data.get("fb_active_key")
+    if not key or key not in context.user_data:
         await update.message.reply_text("❌ Sesión de valoración caducada.")
         return ConversationHandler.END
 
-    session = context.chat_data[key]
+    session = context.user_data[key]
 
     if update.message.text:
         cmd = update.message.text.strip().lower()
@@ -1127,12 +1187,15 @@ async def fb_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def fb_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = context.chat_data.get("fb_active_key")
-    if not key or key not in context.chat_data:
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
+    key = context.user_data.get("fb_active_key")
+    if not key or key not in context.user_data:
         await update.message.reply_text("❌ Sesión de valoración caducada.")
         return ConversationHandler.END
 
-    session = context.chat_data[key]
+    session = context.user_data[key]
 
     feedback_id = db.add_feedback(
         swap_id=int(session["swap_id"]),
@@ -1149,8 +1212,8 @@ async def fb_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("ℹ️ No se pudo guardar (¿ya valoraste este intercambio?).")
 
-    context.chat_data.pop(key, None)
-    context.chat_data.pop("fb_active_key", None)
+    context.user_data.pop(key, None)
+    context.user_data.pop("fb_active_key", None)
     return ConversationHandler.END
 
 
@@ -1386,7 +1449,7 @@ async def admin_swaps(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"u1={s.get('user1_id')}  u2={s.get('user2_id')}\n"
             f"g1={s.get('game1_id')}  g2={s.get('game2_id')}\n"
             f"code={s.get('code')}\n"
-            f"created={str(s.get('created_date',''))[:19]}  updated={str(s.get('updated_date',''))[:19]}\n\n"
+            f"created={str(s.get('created_date'))[:19]}  updated={str(s.get('updated_date'))[:19]}\n\n"
         )
         if len(msg) > 3800:
             msg += "… (truncated)\n"
@@ -1502,7 +1565,9 @@ def main():
         states={
             SWAP_SELECT_OWN: [CallbackQueryHandler(swap_select_own, pattern="^swap_offer:")],
             SWAP_INPUT_OTHER_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, swap_input_other_title)],
-            SWAP_SELECT_OTHER_GAME: [CallbackQueryHandler(swap_select_other_game, pattern="^(swap_take:|swap_cancel_flow$)")],
+            SWAP_SELECT_OTHER_GAME: [
+                CallbackQueryHandler(swap_select_other_game, pattern="^(swap_take:|swap_cancel_flow$)")
+            ],
             SWAP_CONFIRM: [CallbackQueryHandler(swap_confirm, pattern="^(swap_send|swap_cancel)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
