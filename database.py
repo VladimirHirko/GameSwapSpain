@@ -831,3 +831,293 @@ class Database:
         except Exception as e:
             logger.error("❌ Error get_user_feedback: %s", e)
             return []
+
+
+    # ============================
+    # ADMIN HELPERS (minimal set)
+    # ============================
+
+    def admin_list_users(
+        self,
+        limit: int = 10,
+        offset: int = 0,
+        only_banned: bool = False,
+        query: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        Список пользователей для админки.
+        - пагинация: limit/offset
+        - only_banned: показать только забаненных
+        - query: поиск по username/display_name/city (case-insensitive)
+        """
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+
+            q = (query or "").strip()
+            if q.startswith("@"):
+                q = q[1:]
+            params = []
+            where = []
+
+            if only_banned:
+                where.append("is_banned = 1")
+
+            if q:
+                where.append(
+                    "("
+                    "username LIKE ? COLLATE NOCASE OR "
+                    "display_name LIKE ? COLLATE NOCASE OR "
+                    "city LIKE ? COLLATE NOCASE"
+                    ")"
+                )
+                like = f"%{q}%"
+                params.extend([like, like, like])
+
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+            cur.execute(
+                f"""
+                SELECT user_id, username, display_name, city, rating, rating_count, total_swaps, is_banned, registered_date
+                FROM users
+                {where_sql}
+                ORDER BY registered_date DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, int(limit), int(offset)),
+            )
+
+            rows = cur.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error("❌ Error admin_list_users: %s", e)
+            return []
+
+    def admin_count_users(self, only_banned: bool = False, query: Optional[str] = None) -> int:
+        """Сколько пользователей подходит под фильтр (для пагинации)."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+
+            q = (query or "").strip()
+            if q.startswith("@"):
+                q = q[1:]
+
+            params = []
+            where = []
+
+            if only_banned:
+                where.append("is_banned = 1")
+
+            if q:
+                where.append(
+                    "("
+                    "username LIKE ? COLLATE NOCASE OR "
+                    "display_name LIKE ? COLLATE NOCASE OR "
+                    "city LIKE ? COLLATE NOCASE"
+                    ")"
+                )
+                like = f"%{q}%"
+                params.extend([like, like, like])
+
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+            cur.execute(
+                f"SELECT COUNT(*) FROM users {where_sql}",
+                tuple(params),
+            )
+            n = cur.fetchone()[0]
+            conn.close()
+            return int(n)
+        except Exception as e:
+            logger.error("❌ Error admin_count_users: %s", e)
+            return 0
+
+    def admin_get_user(self, user_ref: str) -> Optional[Dict]:
+        """
+        Получить пользователя по:
+        - числовому user_id
+        - @username / username
+        """
+        if user_ref is None:
+            return None
+
+        s = str(user_ref).strip()
+        if not s:
+            return None
+
+        # пробуем как user_id
+        if s.isdigit():
+            return self.get_user(int(s))
+
+        # иначе как username
+        return self.get_user_by_username(s)
+
+    def admin_ban_user(self, user_ref: str, reason: Optional[str] = None) -> bool:
+        """
+        Бан пользователя: is_banned=1.
+        reason пока не сохраняем в БД (можно позже добавить admin_notes),
+        но логируем.
+        """
+        u = self.admin_get_user(user_ref)
+        if not u:
+            return False
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (int(u["user_id"]),))
+            conn.commit()
+            conn.close()
+            logger.warning("🚫 ADMIN BAN user_id=%s username=%s reason=%s", u["user_id"], u.get("username"), reason)
+            return True
+        except Exception as e:
+            logger.error("❌ Error admin_ban_user: %s", e)
+            return False
+
+    def admin_unban_user(self, user_ref: str) -> bool:
+        """Снять бан: is_banned=0."""
+        u = self.admin_get_user(user_ref)
+        if not u:
+            return False
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (int(u["user_id"]),))
+            conn.commit()
+            conn.close()
+            logger.warning("✅ ADMIN UNBAN user_id=%s username=%s", u["user_id"], u.get("username"))
+            return True
+        except Exception as e:
+            logger.error("❌ Error admin_unban_user: %s", e)
+            return False
+
+    def admin_list_user_games(self, user_ref: str, include_removed: bool = True, limit: int = 50) -> List[Dict]:
+        """Игры пользователя (по user_id или @username)."""
+        u = self.admin_get_user(user_ref)
+        if not u:
+            return []
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+
+            if include_removed:
+                cur.execute(
+                    """
+                    SELECT * FROM games
+                    WHERE user_id = ?
+                    ORDER BY created_date DESC
+                    LIMIT ?
+                    """,
+                    (int(u["user_id"]), int(limit)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM games
+                    WHERE user_id = ? AND status = 'active'
+                    ORDER BY created_date DESC
+                    LIMIT ?
+                    """,
+                    (int(u["user_id"]), int(limit)),
+                )
+
+            rows = cur.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error("❌ Error admin_list_user_games: %s", e)
+            return []
+
+    def admin_remove_game(self, game_id: int) -> bool:
+        """
+        Админ-снятие игры: status='removed' без проверки user_id.
+        (Пользовательский remove_game() требует user_id — админке это неудобно.)
+        """
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE games SET status = 'removed' WHERE game_id = ?",
+                (int(game_id),),
+            )
+            conn.commit()
+            changed = cur.rowcount
+            conn.close()
+            return changed > 0
+        except Exception as e:
+            logger.error("❌ Error admin_remove_game: %s", e)
+            return False
+
+    def admin_list_swaps(self, status: Optional[str] = None, limit: int = 20, offset: int = 0) -> List[Dict]:
+        """Список свапов (последние), опционально по статусу."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+
+            if status:
+                cur.execute(
+                    """
+                    SELECT * FROM swaps
+                    WHERE status = ?
+                    ORDER BY COALESCE(updated_date, created_date) DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (str(status), int(limit), int(offset)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM swaps
+                    ORDER BY COALESCE(updated_date, created_date) DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (int(limit), int(offset)),
+                )
+
+            rows = cur.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error("❌ Error admin_list_swaps: %s", e)
+            return []
+
+    def admin_get_stats(self) -> Dict:
+        """Быстрая статистика для /admin_stats."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+
+            cur.execute("SELECT COUNT(*) FROM users")
+            users_total = int(cur.fetchone()[0])
+
+            cur.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+            users_banned = int(cur.fetchone()[0])
+
+            cur.execute("SELECT COUNT(*) FROM games WHERE status = 'active'")
+            games_active = int(cur.fetchone()[0])
+
+            cur.execute("SELECT COUNT(*) FROM swaps WHERE status = 'pending'")
+            swaps_pending = int(cur.fetchone()[0])
+
+            cur.execute("SELECT COUNT(*) FROM swaps WHERE status = 'completed'")
+            swaps_completed = int(cur.fetchone()[0])
+
+            conn.close()
+            return {
+                "users_total": users_total,
+                "users_banned": users_banned,
+                "games_active": games_active,
+                "swaps_pending": swaps_pending,
+                "swaps_completed": swaps_completed,
+            }
+        except Exception as e:
+            logger.error("❌ Error admin_get_stats: %s", e)
+            return {
+                "users_total": 0,
+                "users_banned": 0,
+                "games_active": 0,
+                "swaps_pending": 0,
+                "swaps_completed": 0,
+            }
+

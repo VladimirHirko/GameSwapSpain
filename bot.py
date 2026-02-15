@@ -8,12 +8,25 @@ Versión:
 - Registro + catálogo + поиск
 - Swap (Variant A) + улучшение: выбор игры через @username владельца (без ввода названия)
 - Feedback (rating + comment + photos) tras swap completado
-Requiere database.py (con swaps + feedback + métodos de username)
+Requiere database.py (con swaps + feedback + métodos de username + admin_*)
 
 Fixes importantes:
 - Feedback: NO vuelve a llamar apply_user_rating() (db.add_feedback() ya lo hace)
 - Feedback: sesión por chat_data con key único (swap+to_user), не мешает параллельным сессиям
 - /skip y /done funcionan correctamente
+
+ADMIN (minimal):
+- /admin_users [+query] + кнопки Prev/Next/Filter/Clear
+- /admin_user <id|@username>
+- /admin_ban <id|@username> [reason]
+- /admin_unban <id|@username>
+- /admin_games <id|@username>
+- /admin_remove_game <game_id>
+- /admin_swaps [pending|completed|rejected]
+- /admin_stats
+
+BAN GUARD:
+- Забаненный пользователь не может использовать /add /mygames /search /catalog /profile /swap
 """
 
 import os
@@ -58,7 +71,7 @@ REGISTRATION_NAME, REGISTRATION_CITY = range(2)
 ADD_GAME_TITLE, ADD_GAME_PLATFORM, ADD_GAME_CONDITION, ADD_GAME_PHOTO, ADD_GAME_LOOKING = range(5)
 SEARCH_QUERY = 0
 
-# Swap flow states (NEW)
+# Swap flow states
 SWAP_SELECT_OWN, SWAP_INPUT_OTHER_USERNAME, SWAP_SELECT_OTHER_GAME, SWAP_CONFIRM = range(4)
 
 # Feedback flow states
@@ -136,6 +149,109 @@ def _norm_username(text: str) -> str:
     if t.startswith("@"):
         t = t[1:]
     return t.strip()
+
+
+# ----------------------------
+# Admin helpers + ban guard
+# ----------------------------
+def admin_id() -> int:
+    try:
+        return int(env("ADMIN_ID") or "0")
+    except Exception:
+        return 0
+
+
+def is_admin_user(user_id: int) -> bool:
+    return int(user_id) == int(admin_id())
+
+
+async def banned_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    True => пользователь забанен и мы уже ответили.
+    Используем в командах, чтобы бан реально работал.
+    """
+    try:
+        uid = int(update.effective_user.id)
+        u = db.get_user(uid)
+        if u and int(u.get("is_banned") or 0) == 1:
+            if update.message:
+                await update.message.reply_text("🚫 Tu cuenta está bloqueada por el administrador.")
+            elif update.callback_query:
+                await update.callback_query.answer("🚫 Bloqueado.", show_alert=True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _admin_users_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    st = context.user_data.get("admin_users_state")
+    if not isinstance(st, dict):
+        st = {"offset": 0, "only_banned": False, "query": ""}
+        context.user_data["admin_users_state"] = st
+    return st
+
+
+def _fmt_user_line(u: dict) -> str:
+    ban = "🚫" if int(u.get("is_banned") or 0) == 1 else "✅"
+    username = u.get("username") or "SinUsuario"
+    return (
+        f"{ban} {u.get('user_id')}  @{username} | {u.get('display_name','')} | {u.get('city','')} | "
+        f"⭐{float(u.get('rating') or 0.0):.1f} ({int(u.get('rating_count') or 0)}) | 🔄{int(u.get('total_swaps') or 0)}"
+    )
+
+
+async def _admin_render_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False) -> None:
+    st = _admin_users_state(context)
+    limit = 10
+    offset = int(st.get("offset") or 0)
+    only_banned = bool(st.get("only_banned"))
+    query = (st.get("query") or "").strip()
+
+    total = db.admin_count_users(only_banned=only_banned, query=query)
+    users = db.admin_list_users(limit=limit, offset=offset, only_banned=only_banned, query=query)
+
+    header = "👮 ADMIN — USERS\n"
+    header += f"Filtro: {'SOLO BANEADOS' if only_banned else 'TODOS'}\n"
+    header += f"Buscar: {query if query else '—'}\n"
+    if total == 0:
+        header += "Mostrando: 0\n\n"
+    else:
+        header += f"Mostrando: {offset+1}-{min(offset+len(users), total)} de {total}\n\n"
+
+    if not users:
+        text = header + "No hay usuarios con este filtro."
+    else:
+        lines = "\n".join(_fmt_user_line(u) for u in users)
+        text = header + lines
+
+    kb = []
+    kb.append(
+        [
+            InlineKeyboardButton("🔁 Toggle banned filter", callback_data="adm_users_toggle_banned"),
+            InlineKeyboardButton("🔍 Clear search", callback_data="adm_users_clear_search"),
+        ]
+    )
+
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data="adm_users_prev"))
+    if offset + limit < total:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data="adm_users_next"))
+    if nav:
+        kb.append(nav)
+
+    kb.append([InlineKeyboardButton("ℹ️ Help", callback_data="adm_users_help")])
+
+    markup = InlineKeyboardMarkup(kb)
+
+    if update.callback_query and edit:
+        await update.callback_query.edit_message_text(text=text, reply_markup=markup)
+    else:
+        if update.message:
+            await update.message.reply_text(text=text, reply_markup=markup)
+        elif update.effective_chat:
+            await update.effective_chat.send_message(text=text, reply_markup=markup)
 
 
 # ============================
@@ -230,7 +346,6 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Operación cancelada.", reply_markup=ReplyKeyboardRemove())
-    # cleanup swap temp
     context.user_data.pop("swap_offered_game_id", None)
     context.user_data.pop("swap_other_user_id", None)
     context.user_data.pop("swap_requested_game_id", None)
@@ -241,6 +356,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ADD GAME
 # ============================
 async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     user_id = update.effective_user.id
     user = db.get_user(user_id)
 
@@ -328,7 +446,6 @@ async def add_game_condition(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def add_game_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /skip can arrive as command handler OR as plain text
     if update.message and update.message.text and update.message.text.strip().lower() in {"/skip", "skip"}:
         context.user_data["game_photo"] = None
     elif update.message and update.message.photo:
@@ -399,6 +516,9 @@ async def add_game_looking(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MY GAMES
 # ============================
 async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return
+
     user_id = update.effective_user.id
     user = db.get_user(user_id)
 
@@ -428,6 +548,9 @@ async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SEARCH
 # ============================
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "🔍 BUSCAR JUEGO\n\n"
         "Escribe el nombre del juego que estás buscando:\n"
@@ -488,6 +611,9 @@ async def search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CATALOG
 # ============================
 async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return
+
     user_id = update.effective_user.id
     games = db.get_all_active_games()
 
@@ -520,6 +646,9 @@ async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PROFILE
 # ============================
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return
+
     user_id = update.effective_user.id
     user = db.get_user(user_id)
 
@@ -553,9 +682,12 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================
-# SWAP FLOW (Variant A) — улучшено: выбор по @username
+# SWAP FLOW (Variant A)
 # ============================
 async def swap_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await banned_guard(update, context):
+        return ConversationHandler.END
+
     user_id = update.effective_user.id
     user = db.get_user(user_id)
     if not user:
@@ -872,7 +1004,6 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
 
     await query.edit_message_text("✅ Intercambio confirmado. ¡Listo!")
 
-    # Notify initiator
     try:
         await context.bot.send_message(
             chat_id=int(swap["user1_id"]),
@@ -881,7 +1012,6 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("Failed to notify initiator after swap completion")
 
-    # Optional publish
     try:
         g1 = db.get_game(int(swap["game1_id"]))
         g2 = db.get_game(int(swap["game2_id"]))
@@ -899,7 +1029,6 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         logger.exception("Failed to publish swap completion")
 
-    # Start feedback for both
     await start_feedback_for_user(
         context=context,
         rater_user_id=int(swap["user1_id"]),
@@ -1049,6 +1178,247 @@ async def fb_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================
+# ADMIN COMMANDS
+# ============================
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        return
+
+    query = ""
+    if update.message and update.message.text:
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) == 2:
+            query = parts[1].strip()
+
+    st = _admin_users_state(context)
+    st["offset"] = 0
+    st["query"] = query
+
+    await _admin_render_users_page(update, context, edit=False)
+
+
+async def admin_users_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.callback_query.answer("No access", show_alert=True)
+        return
+
+    q = update.callback_query
+    await q.answer()
+
+    st = _admin_users_state(context)
+    limit = 10
+
+    if q.data == "adm_users_help":
+        await q.edit_message_text(
+            "👮 ADMIN USERS HELP\n\n"
+            "Команды:\n"
+            "/admin_users [query] — список пользователей\n"
+            "/admin_user <id|@username> — карточка\n"
+            "/admin_ban <id|@username> [reason]\n"
+            "/admin_unban <id|@username>\n"
+            "/admin_games <id|@username>\n"
+            "/admin_remove_game <game_id>\n"
+            "/admin_swaps [pending|completed|rejected]\n"
+            "/admin_stats\n\n"
+            "Кнопки тут:\n"
+            "Toggle banned filter — показать только бан\n"
+            "Clear search — сбросить поиск\n"
+            "Prev/Next — листать страницы"
+        )
+        return
+
+    if q.data == "adm_users_toggle_banned":
+        st["only_banned"] = not bool(st.get("only_banned"))
+        st["offset"] = 0
+        await _admin_render_users_page(update, context, edit=True)
+        return
+
+    if q.data == "adm_users_clear_search":
+        st["query"] = ""
+        st["offset"] = 0
+        await _admin_render_users_page(update, context, edit=True)
+        return
+
+    if q.data == "adm_users_prev":
+        st["offset"] = max(0, int(st.get("offset") or 0) - limit)
+        await _admin_render_users_page(update, context, edit=True)
+        return
+
+    if q.data == "adm_users_next":
+        st["offset"] = int(st.get("offset") or 0) + limit
+        await _admin_render_users_page(update, context, edit=True)
+        return
+
+
+async def admin_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        return
+
+    if not update.message or not update.message.text:
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        await update.message.reply_text("Usage: /admin_user <user_id|@username>")
+        return
+
+    ref = parts[1].strip()
+    u = db.admin_get_user(ref)
+    if not u:
+        await update.message.reply_text("❌ Usuario no encontrado.")
+        return
+
+    text = (
+        "👮 ADMIN — USER\n\n"
+        f"ID: {u['user_id']}\n"
+        f"Username: @{u.get('username','')}\n"
+        f"Name: {u.get('display_name','')}\n"
+        f"City: {u.get('city','')}\n"
+        f"Banned: {int(u.get('is_banned') or 0)}\n"
+        f"Rating: {float(u.get('rating') or 0.0):.1f} ({int(u.get('rating_count') or 0)} votes)\n"
+        f"Swaps: {int(u.get('total_swaps') or 0)}\n"
+        f"Registered: {str(u.get('registered_date',''))[:19]}\n"
+    )
+    await update.message.reply_text(text)
+
+
+async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        return
+
+    if not update.message or not update.message.text:
+        return
+
+    parts = update.message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        await update.message.reply_text("Usage: /admin_ban <user_id|@username> [reason]")
+        return
+
+    ref = parts[1].strip()
+    reason = parts[2].strip() if len(parts) == 3 else None
+
+    ok = db.admin_ban_user(ref, reason=reason)
+    await update.message.reply_text("✅ Banned." if ok else "❌ Failed to ban (user not found?).")
+
+
+async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        return
+
+    if not update.message or not update.message.text:
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        await update.message.reply_text("Usage: /admin_unban <user_id|@username>")
+        return
+
+    ref = parts[1].strip()
+    ok = db.admin_unban_user(ref)
+    await update.message.reply_text("✅ Unbanned." if ok else "❌ Failed to unban (user not found?).")
+
+
+async def admin_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        return
+
+    if not update.message or not update.message.text:
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        await update.message.reply_text("Usage: /admin_games <user_id|@username>")
+        return
+
+    ref = parts[1].strip()
+    games = db.admin_list_user_games(ref, include_removed=True, limit=50)
+    if not games:
+        await update.message.reply_text("No games found.")
+        return
+
+    msg = "👮 ADMIN — USER GAMES\n\n"
+    for g in games:
+        msg += (
+            f"#{g['game_id']}  [{g.get('status','')}]\n"
+            f"🎮 {g['title']}\n"
+            f"📱 {g['platform']} | ⭐ {g['condition']}\n"
+            f"🔄 {g['looking_for']}\n"
+            f"📅 {str(g.get('created_date',''))[:10]}\n\n"
+        )
+        if len(msg) > 3800:
+            msg += "… (truncated)\n"
+            break
+
+    msg += "Remove game: /admin_remove_game <game_id>"
+    await update.message.reply_text(msg)
+
+
+async def admin_remove_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        return
+
+    if not update.message or not update.message.text:
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip().isdigit():
+        await update.message.reply_text("Usage: /admin_remove_game <game_id>")
+        return
+
+    gid = int(parts[1].strip())
+    ok = db.admin_remove_game(gid)
+    await update.message.reply_text("✅ Game removed." if ok else "❌ Game not found / not removed.")
+
+
+async def admin_swaps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        return
+
+    status = None
+    if update.message and update.message.text:
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) == 2:
+            status = parts[1].strip().lower()
+
+    swaps = db.admin_list_swaps(status=status, limit=20, offset=0)
+    if not swaps:
+        await update.message.reply_text("No swaps found.")
+        return
+
+    msg = "👮 ADMIN — SWAPS\n\n"
+    for s in swaps:
+        msg += (
+            f"#{s['swap_id']} [{s.get('status','')}]\n"
+            f"u1={s.get('user1_id')}  u2={s.get('user2_id')}\n"
+            f"g1={s.get('game1_id')}  g2={s.get('game2_id')}\n"
+            f"code={s.get('code')}\n"
+            f"created={str(s.get('created_date',''))[:19]}  updated={str(s.get('updated_date',''))[:19]}\n\n"
+        )
+        if len(msg) > 3800:
+            msg += "… (truncated)\n"
+            break
+
+    await update.message.reply_text(msg)
+
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        return
+
+    st = db.admin_get_stats()
+    msg = (
+        "📊 ADMIN STATS\n\n"
+        f"👥 Users total: {st.get('users_total')}\n"
+        f"🚫 Users banned: {st.get('users_banned')}\n"
+        f"🎮 Games active: {st.get('games_active')}\n"
+        f"⏳ Swaps pending: {st.get('swaps_pending')}\n"
+        f"✅ Swaps completed: {st.get('swaps_completed')}\n"
+        f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    )
+    await update.message.reply_text(msg)
+
+
+# ============================
 # HELP
 # ============================
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1082,11 +1452,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================
-# STATS (ADMIN)
+# STATS (ADMIN old command)
 # ============================
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = int(env("ADMIN_ID") or "0")
-    if int(update.effective_user.id) != admin_id:
+    admin_id_val = int(env("ADMIN_ID") or "0")
+    if int(update.effective_user.id) != admin_id_val:
         return
 
     total_users = db.get_total_users()
@@ -1191,6 +1561,17 @@ def main():
 
     application.add_handler(CallbackQueryHandler(swap_accept_or_reject, pattern="^(swap_accept|swap_reject):"))
     application.add_handler(feedback_handler)
+
+    # --- ADMIN minimal set
+    application.add_handler(CommandHandler("admin_users", admin_users))
+    application.add_handler(CallbackQueryHandler(admin_users_buttons, pattern="^adm_users_"))
+    application.add_handler(CommandHandler("admin_user", admin_user))
+    application.add_handler(CommandHandler("admin_ban", admin_ban))
+    application.add_handler(CommandHandler("admin_unban", admin_unban))
+    application.add_handler(CommandHandler("admin_games", admin_games))
+    application.add_handler(CommandHandler("admin_remove_game", admin_remove_game))
+    application.add_handler(CommandHandler("admin_swaps", admin_swaps))
+    application.add_handler(CommandHandler("admin_stats", admin_stats))
 
     logger.info("🤖 Bot iniciado (polling)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
