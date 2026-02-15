@@ -3,8 +3,17 @@
 """
 Módulo de base de datos para GameSwap Bot
 Gestión de base de datos SQLite
+
+Versión: con swaps (pending->completed con cambio de dueño) + feedback (rating/comment/photos)
+Compatible con Railway (ruta por defecto /data/gameswap.db)
+
+Notas:
+- Mantiene compatibilidad con tablas existentes.
+- Hace migraciones ligeras via ALTER TABLE si faltan columnas.
+- Recomendado: en Railway definir variable DB_FILE=/data/gameswap.db (opcional).
 """
 
+import os
 import sqlite3
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple
@@ -19,14 +28,19 @@ class Database:
     """Clase para gestionar la base de datos"""
 
     def __init__(self, db_file: str = "/data/gameswap.db"):
-        """Inicialización de la base de datos"""
-        self.db_file = db_file
+        # ✅ permite controlar ruta desde Railway
+        self.db_file = db_file or os.getenv("DB_FILE", "/data/gameswap.db")
         self.init_database()
 
-    def get_connection(self):
-        """Obtener conexión a la base de datos"""
+    # ----------------------------
+    # Low-level helpers
+    # ----------------------------
+    def get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_file)
         conn.row_factory = sqlite3.Row
+        # opcional: mejora concurrencia en SQLite
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
     def _now(self) -> str:
@@ -42,12 +56,15 @@ class Database:
         rows = cur.fetchall()
         return {r["name"] for r in rows}
 
-    def init_database(self):
+    # ----------------------------
+    # Schema init + lightweight migrations
+    # ----------------------------
+    def init_database(self) -> None:
         """Crear tablas si no existen + migraciones simples"""
         conn = self.get_connection()
         cursor = conn.cursor()
 
-        # Tabla de usuarios
+        # ---- users
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -64,7 +81,7 @@ class Database:
             """
         )
 
-        # Tabla de juegos
+        # ---- games
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS games (
@@ -82,7 +99,7 @@ class Database:
             """
         )
 
-        # Tabla de intercambios (ya existe en tu proyecto; la dejamos y la ampliamos)
+        # ---- swaps (existing) + keep compatibility
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS swaps (
@@ -104,31 +121,65 @@ class Database:
             """
         )
 
-        # ---- MIGRACIONES: añadimos columnas nuevas si faltan ----
-        cols = self._table_columns(conn, "swaps")
+        # ---- feedback tables (new)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS swap_feedback (
+                feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                swap_id INTEGER NOT NULL,
+                from_user_id INTEGER NOT NULL,
+                to_user_id INTEGER NOT NULL,
+                stars INTEGER NOT NULL CHECK(stars >= 1 AND stars <= 5),
+                comment TEXT,
+                created_date TEXT NOT NULL,
+                FOREIGN KEY (swap_id) REFERENCES swaps (swap_id),
+                FOREIGN KEY (from_user_id) REFERENCES users (user_id),
+                FOREIGN KEY (to_user_id) REFERENCES users (user_id)
+            )
+            """
+        )
 
-        # code, status, created_date, updated_date
-        if "code" not in cols:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS swap_feedback_photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feedback_id INTEGER NOT NULL,
+                photo_file_id TEXT NOT NULL,
+                created_date TEXT NOT NULL,
+                FOREIGN KEY (feedback_id) REFERENCES swap_feedback (feedback_id)
+            )
+            """
+        )
+
+        # ---- MIGRATIONS: swaps new columns
+        cols_swaps = self._table_columns(conn, "swaps")
+        if "code" not in cols_swaps:
             cursor.execute("ALTER TABLE swaps ADD COLUMN code TEXT")
-        if "status" not in cols:
+        if "status" not in cols_swaps:
             cursor.execute("ALTER TABLE swaps ADD COLUMN status TEXT DEFAULT 'pending'")
-        if "created_date" not in cols:
+        if "created_date" not in cols_swaps:
             cursor.execute("ALTER TABLE swaps ADD COLUMN created_date TEXT")
-        if "updated_date" not in cols:
+        if "updated_date" not in cols_swaps:
             cursor.execute("ALTER TABLE swaps ADD COLUMN updated_date TEXT")
+
+        # ---- MIGRATIONS: users rating_sum / rating_count (stable rating update)
+        cols_users = self._table_columns(conn, "users")
+        if "rating_sum" not in cols_users:
+            cursor.execute("ALTER TABLE users ADD COLUMN rating_sum INTEGER DEFAULT 0")
+        if "rating_count" not in cols_users:
+            cursor.execute("ALTER TABLE users ADD COLUMN rating_count INTEGER DEFAULT 0")
 
         conn.commit()
         conn.close()
         logger.info("✅ Base de datos inicializada (y migrada si hacía falta)")
 
-    # ============= USUARIOS =============
-
+    # ============================
+    # USERS
+    # ============================
     def create_user(self, user_id: int, username: str, display_name: str, city: str) -> bool:
-        """Crear un nuevo usuario"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-
             cursor.execute(
                 """
                 INSERT INTO users (user_id, username, display_name, city, registered_date)
@@ -136,32 +187,27 @@ class Database:
                 """,
                 (user_id, username, display_name, city, self._now()),
             )
-
             conn.commit()
             conn.close()
-            logger.info(f"✅ Usuario {display_name} creado")
+            logger.info("✅ Usuario %s creado", display_name)
             return True
         except Exception as e:
-            logger.error(f"❌ Error al crear usuario: {e}")
+            logger.error("❌ Error al crear usuario: %s", e)
             return False
 
     def get_user(self, user_id: int) -> Optional[Dict]:
-        """Obtener datos de un usuario"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-
             cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
             conn.close()
-
             return dict(row) if row else None
         except Exception as e:
-            logger.error(f"❌ Error al obtener usuario: {e}")
+            logger.error("❌ Error al obtener usuario: %s", e)
             return None
 
     def get_total_users(self) -> int:
-        """Obtener el número total de usuarios"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -169,15 +215,15 @@ class Database:
             count = cursor.fetchone()[0]
             conn.close()
             return int(count)
-        except:
+        except Exception:
             return 0
 
-    def update_user_rating(self, user_id: int, new_rating: float):
-        """Actualizar la valoración del usuario"""
+    # Legacy method (kept): sets rating directly, increments total_swaps.
+    # Prefer apply_user_rating() for new feedback flow.
+    def update_user_rating(self, user_id: int, new_rating: float) -> bool:
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-
             cursor.execute(
                 """
                 UPDATE users
@@ -186,16 +232,62 @@ class Database:
                 """,
                 (new_rating, user_id),
             )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error("❌ Error al actualizar valoración: %s", e)
+            return False
+
+    def apply_user_rating(self, to_user_id: int, stars: int) -> bool:
+        """
+        rating_sum += stars; rating_count += 1; rating = rating_sum / rating_count
+        """
+        if stars < 1 or stars > 5:
+            return False
+
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("BEGIN")
+
+            cur.execute("SELECT rating_sum, rating_count FROM users WHERE user_id = ?", (to_user_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.execute("ROLLBACK")
+                conn.close()
+                return False
+
+            rs = int(row["rating_sum"] or 0) + int(stars)
+            rc = int(row["rating_count"] or 0) + 1
+            rating = rs / rc if rc else 0.0
+
+            cur.execute(
+                """
+                UPDATE users
+                SET rating_sum = ?, rating_count = ?, rating = ?
+                WHERE user_id = ?
+                """,
+                (rs, rc, float(rating), to_user_id),
+            )
 
             conn.commit()
             conn.close()
             return True
         except Exception as e:
-            logger.error(f"❌ Error al actualizar valoración: {e}")
+            logger.error("❌ Error apply_user_rating: %s", e)
+            try:
+                if conn:
+                    conn.rollback()
+                    conn.close()
+            except Exception:
+                pass
             return False
 
-    # ============= JUEGOS =============
-
+    # ============================
+    # GAMES
+    # ============================
     def add_game(
         self,
         user_id: int,
@@ -205,11 +297,9 @@ class Database:
         photo_url: Optional[str],
         looking_for: str,
     ) -> Optional[int]:
-        """Añadir un juego"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-
             cursor.execute(
                 """
                 INSERT INTO games (user_id, title, platform, condition, photo_url, looking_for, created_date)
@@ -217,19 +307,16 @@ class Database:
                 """,
                 (user_id, title, platform, condition, photo_url, looking_for, self._now()),
             )
-
             game_id = cursor.lastrowid
             conn.commit()
             conn.close()
-
-            logger.info(f"✅ Juego {title} añadido (ID: {game_id})")
+            logger.info("✅ Juego %s añadido (ID: %s)", title, game_id)
             return int(game_id)
         except Exception as e:
-            logger.error(f"❌ Error al añadir juego: {e}")
+            logger.error("❌ Error al añadir juego: %s", e)
             return None
 
     def get_game(self, game_id: int) -> Optional[Dict]:
-        """Obtener un juego por ID"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -238,15 +325,13 @@ class Database:
             conn.close()
             return dict(row) if row else None
         except Exception as e:
-            logger.error(f"❌ Error al obtener juego: {e}")
+            logger.error("❌ Error al obtener juego: %s", e)
             return None
 
     def get_user_games(self, user_id: int) -> List[Dict]:
-        """Obtener todos los juegos activos de un usuario"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-
             cursor.execute(
                 """
                 SELECT * FROM games
@@ -255,21 +340,17 @@ class Database:
                 """,
                 (user_id,),
             )
-
             rows = cursor.fetchall()
             conn.close()
-
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"❌ Error al obtener juegos del usuario: {e}")
+            logger.error("❌ Error al obtener juegos del usuario: %s", e)
             return []
 
     def get_all_active_games(self) -> List[Dict]:
-        """Obtener todos los juegos activos"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-
             cursor.execute(
                 """
                 SELECT * FROM games
@@ -277,21 +358,17 @@ class Database:
                 ORDER BY created_date DESC
                 """
             )
-
             rows = cursor.fetchall()
             conn.close()
-
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"❌ Error al obtener todos los juegos activos: {e}")
+            logger.error("❌ Error al obtener todos los juegos activos: %s", e)
             return []
 
     def search_games(self, query: str) -> List[Dict]:
-        """Buscar juegos por título (solo active)"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-
             cursor.execute(
                 """
                 SELECT * FROM games
@@ -301,21 +378,17 @@ class Database:
                 """,
                 (f"%{query}%",),
             )
-
             rows = cursor.fetchall()
             conn.close()
-
             return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"❌ Error en la búsqueda de juegos: {e}")
+            logger.error("❌ Error en la búsqueda de juegos: %s", e)
             return []
 
     def remove_game(self, game_id: int, user_id: int) -> bool:
-        """Eliminar un juego (cambiar estado)"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-
             cursor.execute(
                 """
                 UPDATE games
@@ -324,16 +397,14 @@ class Database:
                 """,
                 (game_id, user_id),
             )
-
             conn.commit()
             conn.close()
             return True
         except Exception as e:
-            logger.error(f"❌ Error al eliminar juego: {e}")
+            logger.error("❌ Error al eliminar juego: %s", e)
             return False
 
     def get_total_games(self) -> int:
-        """Obtener cantidad de juegos activos"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -341,12 +412,15 @@ class Database:
             count = cursor.fetchone()[0]
             conn.close()
             return int(count)
-        except:
+        except Exception:
             return 0
 
-    # ============= INTERCAMBIOS (nuevo flujo) =============
-
-    def create_swap_request(self, user1_id: int, user2_id: int, game1_id: int, game2_id: int) -> Optional[Tuple[int, str]]:
+    # ============================
+    # SWAPS (new flow)
+    # ============================
+    def create_swap_request(
+        self, user1_id: int, user2_id: int, game1_id: int, game2_id: int
+    ) -> Optional[Tuple[int, str]]:
         """
         Crea un swap pending y devuelve (swap_id, code).
         user1 = iniciador, user2 = receptor.
@@ -356,15 +430,17 @@ class Database:
             conn = self.get_connection()
             cursor = conn.cursor()
 
-            # sanity: validate ownership + active
-            cursor.execute("SELECT game_id, user_id, status FROM games WHERE game_id IN (?, ?)", (game1_id, game2_id))
+            cursor.execute(
+                "SELECT game_id, user_id, status FROM games WHERE game_id IN (?, ?)",
+                (game1_id, game2_id),
+            )
             rows = cursor.fetchall()
             if len(rows) != 2:
                 conn.close()
                 return None
 
-            info = {r["game_id"]: dict(r) for r in rows}
-            if info[game1_id]["user_id"] != user1_id or info[game2_id]["user_id"] != user2_id:
+            info = {int(r["game_id"]): dict(r) for r in rows}
+            if info.get(game1_id, {}).get("user_id") != user1_id or info.get(game2_id, {}).get("user_id") != user2_id:
                 conn.close()
                 return None
             if info[game1_id]["status"] != "active" or info[game2_id]["status"] != "active":
@@ -374,12 +450,13 @@ class Database:
             code = self._gen_swap_code()
             now = self._now()
 
-            # keep old flags for compatibility, but use status/code
             cursor.execute(
                 """
-                INSERT INTO swaps (user1_id, user2_id, game1_id, game2_id,
-                                   confirmed_by_user1, confirmed_by_user2,
-                                   status, code, created_date, updated_date)
+                INSERT INTO swaps (
+                    user1_id, user2_id, game1_id, game2_id,
+                    confirmed_by_user1, confirmed_by_user2,
+                    status, code, created_date, updated_date
+                )
                 VALUES (?, ?, ?, ?, 1, 0, 'pending', ?, ?, ?)
                 """,
                 (user1_id, user2_id, game1_id, game2_id, code, now, now),
@@ -390,7 +467,7 @@ class Database:
             conn.close()
             return int(swap_id), code
         except Exception as e:
-            logger.error(f"❌ Error al crear intercambio: {e}")
+            logger.error("❌ Error al crear intercambio: %s", e)
             return None
 
     def get_swap(self, swap_id: int) -> Optional[Dict]:
@@ -402,7 +479,7 @@ class Database:
             conn.close()
             return dict(row) if row else None
         except Exception as e:
-            logger.error(f"❌ Error al obtener intercambio: {e}")
+            logger.error("❌ Error al obtener intercambio: %s", e)
             return None
 
     def set_swap_status(self, swap_id: int, status: str) -> bool:
@@ -417,27 +494,28 @@ class Database:
             conn.close()
             return True
         except Exception as e:
-            logger.error(f"❌ Error al actualizar estado del intercambio: {e}")
+            logger.error("❌ Error al actualizar estado del intercambio: %s", e)
             return False
 
     def complete_swap(self, swap_id: int, confirmer_user_id: int) -> Tuple[bool, str]:
         """
-        Confirmación por user2. Hace swap de owners en games y marca completed.
-        Devuelve (ok, message_error)
+        Confirmación por user2.
+        Cambia dueños de los juegos y marca swap como completed.
+        Devuelve (ok, error_message)
         """
-        conn = None
+        conn: Optional[sqlite3.Connection] = None
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
             cursor.execute("BEGIN")
 
             cursor.execute("SELECT * FROM swaps WHERE swap_id = ?", (swap_id,))
-            swap = cursor.fetchone()
-            if not swap:
+            swap_row = cursor.fetchone()
+            if not swap_row:
                 cursor.execute("ROLLBACK")
                 return False, "swap not found"
 
-            swap = dict(swap)
+            swap = dict(swap_row)
 
             if swap.get("status") != "pending":
                 cursor.execute("ROLLBACK")
@@ -447,19 +525,21 @@ class Database:
                 cursor.execute("ROLLBACK")
                 return False, "only recipient can confirm"
 
-            user1_id = swap["user1_id"]
-            user2_id = swap["user2_id"]
-            game1_id = swap["game1_id"]
-            game2_id = swap["game2_id"]
+            user1_id = int(swap["user1_id"])
+            user2_id = int(swap["user2_id"])
+            game1_id = int(swap["game1_id"])
+            game2_id = int(swap["game2_id"])
 
-            # verify current owners and status
-            cursor.execute("SELECT game_id, user_id, status FROM games WHERE game_id IN (?, ?)", (game1_id, game2_id))
+            cursor.execute(
+                "SELECT game_id, user_id, status FROM games WHERE game_id IN (?, ?)",
+                (game1_id, game2_id),
+            )
             rows = cursor.fetchall()
             if len(rows) != 2:
                 cursor.execute("ROLLBACK")
                 return False, "game not found"
 
-            g = {r["game_id"]: dict(r) for r in rows}
+            g = {int(r["game_id"]): dict(r) for r in rows}
             if g[game1_id]["user_id"] != user1_id or g[game2_id]["user_id"] != user2_id:
                 cursor.execute("ROLLBACK")
                 return False, "owners changed; cannot complete"
@@ -471,7 +551,6 @@ class Database:
             cursor.execute("UPDATE games SET user_id = ? WHERE game_id = ?", (user2_id, game1_id))
             cursor.execute("UPDATE games SET user_id = ? WHERE game_id = ?", (user1_id, game2_id))
 
-            # mark swap completed
             now = self._now()
             cursor.execute(
                 """
@@ -485,8 +564,11 @@ class Database:
                 (now, now, swap_id),
             )
 
-            # increment counters
-            cursor.execute("UPDATE users SET total_swaps = total_swaps + 1 WHERE user_id IN (?, ?)", (user1_id, user2_id))
+            # counters
+            cursor.execute(
+                "UPDATE users SET total_swaps = total_swaps + 1 WHERE user_id IN (?, ?)",
+                (user1_id, user2_id),
+            )
 
             conn.commit()
             conn.close()
@@ -501,7 +583,6 @@ class Database:
             return False, str(e)
 
     def get_total_swaps(self) -> int:
-        """Obtener cantidad de intercambios completados"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -509,5 +590,129 @@ class Database:
             count = cursor.fetchone()[0]
             conn.close()
             return int(count)
-        except:
+        except Exception:
             return 0
+
+    # ============================
+    # FEEDBACK (rating/comment/photos)
+    # ============================
+    def add_feedback(
+        self,
+        swap_id: int,
+        from_user_id: int,
+        to_user_id: int,
+        stars: int,
+        comment: Optional[str],
+    ) -> Optional[int]:
+        if stars < 1 or stars > 5:
+            return None
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+
+            # prevent duplicate feedback from same user for same swap
+            cur.execute(
+                """
+                SELECT feedback_id FROM swap_feedback
+                WHERE swap_id = ? AND from_user_id = ?
+                """,
+                (swap_id, from_user_id),
+            )
+            if cur.fetchone():
+                conn.close()
+                return None
+
+            cur.execute(
+                """
+                INSERT INTO swap_feedback (swap_id, from_user_id, to_user_id, stars, comment, created_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (swap_id, from_user_id, to_user_id, int(stars), comment, self._now()),
+            )
+            fid = cur.lastrowid
+            conn.commit()
+            conn.close()
+
+            # update rating aggregates
+            self.apply_user_rating(to_user_id=to_user_id, stars=stars)
+
+            return int(fid)
+        except Exception as e:
+            logger.error("❌ Error add_feedback: %s", e)
+            return None
+
+    def add_feedback_photo(self, feedback_id: int, photo_file_id: str) -> bool:
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO swap_feedback_photos (feedback_id, photo_file_id, created_date)
+                VALUES (?, ?, ?)
+                """,
+                (feedback_id, photo_file_id, self._now()),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error("❌ Error add_feedback_photo: %s", e)
+            return False
+
+    def get_feedback_photos(self, feedback_id: int) -> List[str]:
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT photo_file_id FROM swap_feedback_photos
+                WHERE feedback_id = ?
+                ORDER BY id ASC
+                """,
+                (feedback_id,),
+            )
+            rows = cur.fetchall()
+            conn.close()
+            return [r["photo_file_id"] for r in rows]
+        except Exception as e:
+            logger.error("❌ Error get_feedback_photos: %s", e)
+            return []
+
+    def get_user_feedback_summary(self, user_id: int) -> Dict:
+        """
+        Small helper for profile screens:
+        returns {rating, rating_count}
+        """
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT rating, rating_count FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            conn.close()
+            if not row:
+                return {"rating": 0.0, "rating_count": 0}
+            return {"rating": float(row["rating"] or 0.0), "rating_count": int(row["rating_count"] or 0)}
+        except Exception:
+            return {"rating": 0.0, "rating_count": 0}
+
+    def get_user_feedback(self, user_id: int, limit: int = 20) -> List[Dict]:
+        """Lista de feedback recibidos por un usuario."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT *
+                FROM swap_feedback
+                WHERE to_user_id = ?
+                ORDER BY created_date DESC
+                LIMIT ?
+                """,
+                (user_id, int(limit)),
+            )
+            rows = cur.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error("❌ Error get_user_feedback: %s", e)
+            return []

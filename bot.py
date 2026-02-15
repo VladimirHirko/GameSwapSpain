@@ -3,6 +3,16 @@
 """
 GameSwap Spain Bot
 Bot para intercambio de juegos entre gamers
+
+Versión: tu código + Swap (Variant A) + Feedback (rating + comment + photos) tras swap completado.
+Requiere database.py (con tablas swap_feedback y swap_feedback_photos + add_feedback() que ya aplica rating).
+
+✅ Fixes importantes en esta versión:
+- Feedback: NO vuelve a llamar apply_user_rating() (ya se hace dentro de db.add_feedback()).
+- Feedback: se guarda por usuario (chat_data) y NO pisa feedback de otros swaps.
+- Feedback: soporta varios swaps en paralelo y evita mezclar sesiones.
+- /skip y /done funcionan correctamente (sin pasar a handler equivocado).
+- Botones de estrellas usan label consistente.
 """
 
 import os
@@ -50,11 +60,13 @@ SEARCH_QUERY = 0
 # Swap flow states
 SWAP_SELECT_OWN, SWAP_SEARCH_OTHER, SWAP_SELECT_OTHER, SWAP_CONFIRM = range(4)
 
+# Feedback flow states (after swap completed)
+FB_TEXT, FB_PHOTOS = range(2)
+
 # ----------------------------
 # DB
 # ----------------------------
 db = Database()
-
 
 # ----------------------------
 # Helpers
@@ -103,10 +115,19 @@ def fmt_game(g: dict) -> str:
 
 
 def fmt_user(u: dict) -> str:
-    username = u.get("username") or "SinUsuario"
+    username = (u.get("username") or "SinUsuario").strip()
     if not username.startswith("@"):
         username = "@" + username
     return username
+
+
+def stars_label(n: int) -> str:
+    n = max(1, min(5, int(n)))
+    return "⭐" * n + "☆" * (5 - n)
+
+
+def _fb_key(swap_id: int, to_user_id: int) -> str:
+    return f"fb:{int(swap_id)}:{int(to_user_id)}"
 
 
 # ============================
@@ -492,12 +513,16 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     games_count = len(db.get_user_games(user_id))
 
+    summary = db.get_user_feedback_summary(user_id)
+    rating = summary.get("rating", float(user.get("rating") or 0.0))
+    rating_count = summary.get("rating_count", 0)
+
     message = (
         "👤 TU PERFIL\n\n"
         f"Nombre: {user['display_name']}\n"
         f"Usuario: @{user['username']}\n"
         f"📍 Ciudad: {user['city']}\n"
-        f"⭐ Valoración: {user['rating']:.1f}/5.0\n"
+        f"⭐ Valoración: {rating:.1f}/5.0 ({rating_count} votos)\n"
         f"🔄 Intercambios completados: {user['total_swaps']}\n"
         f"🎮 Juegos activos: {games_count}\n"
         f"📅 En GameSwap desde: {user['registered_date'][:10]}\n\n"
@@ -568,14 +593,10 @@ async def swap_search_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = [g for g in results if g["user_id"] != user_id]  # other users only
 
     if not results:
-        await update.message.reply_text(
-            f"😔 No encontré «{text}» en el catálogo.\n\n"
-            "Prueba con otro nombre."
-        )
+        await update.message.reply_text(f"😔 No encontré «{text}» en el catálogo.\n\nPrueba con otro nombre.")
         return SWAP_SEARCH_OTHER
 
     results = results[:15]
-
     keyboard = []
     for g in results:
         owner = db.get_user(g["user_id"])
@@ -583,10 +604,7 @@ async def swap_search_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"{fmt_game(g)} — {fmt_user(owner)}", callback_data=f"swap_take:{g['game_id']}")]
         )
 
-    await update.message.reply_text(
-        "Paso 3/3 — Elige el juego que recibiste:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await update.message.reply_text("Paso 3/3 — Elige el juego que recibiste:", reply_markup=InlineKeyboardMarkup(keyboard))
     return SWAP_SELECT_OTHER
 
 
@@ -670,7 +688,6 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     swap_id, code = created
-
     initiator = db.get_user(initiator_id)
 
     await query.edit_message_text(
@@ -702,6 +719,9 @@ async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ----------------------------
+# Swap accept/reject callbacks
+# ----------------------------
 async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -715,7 +735,7 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     user_id = update.effective_user.id
-    if user_id != swap["user2_id"]:
+    if user_id != int(swap["user2_id"]):
         await query.edit_message_text("❌ Solo el segundo participante puede confirmar/rechazar.")
         return
 
@@ -727,7 +747,7 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
         db.set_swap_status(swap_id, "rejected")
         await query.edit_message_text("❌ Has rechazado el intercambio.")
         try:
-            await context.bot.send_message(chat_id=swap["user1_id"], text="❌ Tu solicitud de intercambio fue rechazada.")
+            await context.bot.send_message(chat_id=int(swap["user1_id"]), text="❌ Tu solicitud de intercambio fue rechazada.")
         except Exception:
             logger.exception("Failed to notify initiator about rejection")
         return
@@ -739,30 +759,185 @@ async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TY
 
     await query.edit_message_text("✅ Intercambio confirmado. ¡Listo!")
 
+    # Notify initiator
     try:
         await context.bot.send_message(
-            chat_id=swap["user1_id"],
+            chat_id=int(swap["user1_id"]),
             text="✅ Tu intercambio fue confirmado. Los juegos cambiaron de dueño.",
         )
     except Exception:
         logger.exception("Failed to notify initiator after swap completion")
 
-    # optional: publish
+    # Optional: publish to channel/group
     try:
-        g1 = db.get_game(swap["game1_id"])
-        g2 = db.get_game(swap["game2_id"])
-        u1 = db.get_user(swap["user1_id"])
-        u2 = db.get_user(swap["user2_id"])
-        await safe_publish_text(
-            context,
-            text=(
-                "🔄 Intercambio completado\n\n"
-                f"{fmt_user(u1)} ↔ {fmt_user(u2)}\n"
-                f"🎮 {g1['title']} ⇄ 🎮 {g2['title']}"
-            ),
-        )
+        g1 = db.get_game(int(swap["game1_id"]))
+        g2 = db.get_game(int(swap["game2_id"]))
+        u1 = db.get_user(int(swap["user1_id"]))
+        u2 = db.get_user(int(swap["user2_id"]))
+        if g1 and g2 and u1 and u2:
+            await safe_publish_text(
+                context,
+                text=(
+                    "🔄 Intercambio completado\n\n"
+                    f"{fmt_user(u1)} ↔ {fmt_user(u2)}\n"
+                    f"🎮 {g1['title']} ⇄ 🎮 {g2['title']}"
+                ),
+            )
     except Exception:
         logger.exception("Failed to publish swap completion")
+
+    # Start feedback flow for BOTH users (in DM)
+    await start_feedback_for_user(
+        context=context,
+        rater_user_id=int(swap["user1_id"]),
+        ratee_user_id=int(swap["user2_id"]),
+        swap_id=swap_id,
+    )
+    await start_feedback_for_user(
+        context=context,
+        rater_user_id=int(swap["user2_id"]),
+        ratee_user_id=int(swap["user1_id"]),
+        swap_id=swap_id,
+    )
+
+
+# ============================
+# FEEDBACK FLOW
+# ============================
+async def start_feedback_for_user(
+    context: ContextTypes.DEFAULT_TYPE, rater_user_id: int, ratee_user_id: int, swap_id: int
+):
+    """Send DM to rater with inline stars."""
+    ratee = db.get_user(ratee_user_id) or {"username": "SinUsuario"}
+    text = (
+        "⭐ VALORACIÓN DEL INTERCAMBIO\n\n"
+        f"Valora a {fmt_user(ratee)}.\n"
+        "Elige estrellas:"
+    )
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(stars_label(i), callback_data=f"fb_stars:{swap_id}:{ratee_user_id}:{i}")] for i in range(5, 0, -1)]
+        + [[InlineKeyboardButton("Omitir", callback_data=f"fb_skip:{swap_id}:{ratee_user_id}")]]
+    )
+    await context.bot.send_message(chat_id=rater_user_id, text=text, reply_markup=kb)
+
+
+async def fb_stars_or_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Callback when user selects stars or skip.
+    We store a per-chat pending feedback session in context.chat_data.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    action = parts[0]  # fb_stars or fb_skip
+    swap_id = int(parts[1])
+    ratee_user_id = int(parts[2])
+    rater_user_id = update.effective_user.id
+
+    if action == "fb_skip":
+        await query.edit_message_text("👍 Ok, sin valoración.")
+        return ConversationHandler.END
+
+    stars = int(parts[3])
+    key = _fb_key(swap_id, ratee_user_id)
+
+    # Store session in chat_data (safe for parallel users)
+    context.chat_data[key] = {
+        "swap_id": swap_id,
+        "from_user_id": rater_user_id,
+        "to_user_id": ratee_user_id,
+        "stars": stars,
+        "comment": None,
+        "photos": [],
+    }
+    context.chat_data["fb_active_key"] = key
+
+    await query.edit_message_text(
+        f"⭐ Has elegido: {stars_label(stars)}\n\n"
+        "Ahora escribe un comentario corto (o escribe /skip para omitir):"
+    )
+    return FB_TEXT
+
+
+async def fb_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key = context.chat_data.get("fb_active_key")
+    if not key or key not in context.chat_data:
+        await update.message.reply_text("❌ Sesión de valoración caducada.")
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    if text.lower() in {"/skip", "skip"}:
+        context.chat_data[key]["comment"] = None
+    else:
+        context.chat_data[key]["comment"] = text[:800]
+
+    await update.message.reply_text(
+        "📸 Puedes enviar hasta 3 fotos como prueba (una por mensaje).\n"
+        "Cuando termines, escribe /done.\n"
+        "O escribe /skip para no enviar fotos."
+    )
+    return FB_PHOTOS
+
+
+async def fb_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key = context.chat_data.get("fb_active_key")
+    if not key or key not in context.chat_data:
+        await update.message.reply_text("❌ Sesión de valoración caducada.")
+        return ConversationHandler.END
+
+    session = context.chat_data[key]
+
+    if update.message.text:
+        cmd = update.message.text.strip().lower()
+        if cmd in {"/skip", "skip", "/done", "done"}:
+            return await fb_finish(update, context)
+        await update.message.reply_text("Envía una foto, o escribe /done para terminar.")
+        return FB_PHOTOS
+
+    if not update.message.photo:
+        await update.message.reply_text("Envía una foto, o escribe /done.")
+        return FB_PHOTOS
+
+    if len(session["photos"]) >= 3:
+        await update.message.reply_text("Ya tienes 3 fotos. Escribe /done para terminar.")
+        return FB_PHOTOS
+
+    file_id = update.message.photo[-1].file_id
+    session["photos"].append(file_id)
+
+    await update.message.reply_text(f"✅ Foto añadida ({len(session['photos'])}/3). Envía otra o escribe /done.")
+    return FB_PHOTOS
+
+
+async def fb_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key = context.chat_data.get("fb_active_key")
+    if not key or key not in context.chat_data:
+        await update.message.reply_text("❌ Sesión de valoración caducada.")
+        return ConversationHandler.END
+
+    session = context.chat_data[key]
+
+    feedback_id = db.add_feedback(
+        swap_id=int(session["swap_id"]),
+        from_user_id=int(session["from_user_id"]),
+        to_user_id=int(session["to_user_id"]),
+        stars=int(session["stars"]),
+        comment=session.get("comment"),
+    )
+
+    if feedback_id:
+        for p in session.get("photos", []):
+            db.add_feedback_photo(int(feedback_id), p)
+        await update.message.reply_text("✅ ¡Gracias! Valoración guardada.")
+    else:
+        await update.message.reply_text("ℹ️ No se pudo guardar (¿ya valoraste este intercambio?).")
+
+    # cleanup only this session
+    context.chat_data.pop(key, None)
+    context.chat_data.pop("fb_active_key", None)
+
+    return ConversationHandler.END
 
 
 # ============================
@@ -786,7 +961,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Escribe al dueño por privado\n"
         "4. Quedáis en un lugar público\n"
         "5. Intercambio 1×1\n"
-        "6. Confirmad el intercambio con /swap\n\n"
+        "6. Confirmad el intercambio con /swap\n"
+        "7. Dejad valoración (⭐) después del swap\n\n"
         "🛡️ SEGURIDAD:\n"
         "• Quedar siempre en sitios concurridos\n"
         "• Comprobar el disco antes de entregar\n"
@@ -871,6 +1047,25 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # Feedback handler: entry via callback fb_stars / fb_skip, then messages
+    feedback_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(fb_stars_or_skip, pattern="^(fb_stars|fb_skip):")],
+        states={
+            FB_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fb_text),
+                CommandHandler("skip", fb_text),
+            ],
+            FB_PHOTOS: [
+                MessageHandler(filters.PHOTO, fb_photos),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fb_photos),
+                CommandHandler("done", fb_photos),
+                CommandHandler("skip", fb_photos),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
     application.add_handler(registration_handler)
     application.add_handler(add_game_handler)
     application.add_handler(search_handler)
@@ -882,8 +1077,11 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stats", stats))
 
-    # accept/reject callbacks
+    # accept/reject callbacks (swap)
     application.add_handler(CallbackQueryHandler(swap_accept_or_reject, pattern="^(swap_accept|swap_reject):"))
+
+    # feedback conversation
+    application.add_handler(feedback_handler)
 
     logger.info("🤖 Bot iniciado (polling)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
