@@ -47,6 +47,9 @@ REGISTRATION_NAME, REGISTRATION_CITY = range(2)
 ADD_GAME_TITLE, ADD_GAME_PLATFORM, ADD_GAME_CONDITION, ADD_GAME_PHOTO, ADD_GAME_LOOKING = range(5)
 SEARCH_QUERY = 0
 
+# Swap flow states
+SWAP_SELECT_OWN, SWAP_SEARCH_OTHER, SWAP_SELECT_OTHER, SWAP_CONFIRM = range(4)
+
 # ----------------------------
 # DB
 # ----------------------------
@@ -57,7 +60,6 @@ db = Database()
 # Helpers
 # ----------------------------
 def env(name: str) -> str | None:
-    """Read env var and normalize: strip spaces and wrapping quotes."""
     v = os.getenv(name)
     if not v:
         return None
@@ -65,13 +67,6 @@ def env(name: str) -> str | None:
 
 
 def publish_target_chat_id() -> str | int | None:
-    """
-    Where to publish announcements.
-    Priority:
-      1) CHANNEL_CHAT_ID (e.g. @GameSwapSpain or -100...)
-      2) GROUP_CHAT_ID   (fallback)
-    Returns int if numeric, else str (for @username).
-    """
     v = env("CHANNEL_CHAT_ID") or env("GROUP_CHAT_ID")
     if not v:
         return None
@@ -88,7 +83,6 @@ async def safe_publish_text(context: ContextTypes.DEFAULT_TYPE, text: str) -> No
         return
     try:
         await context.bot.send_message(chat_id=chat_id, text=text)
-        logger.info("Published text to %r", chat_id)
     except Exception:
         logger.exception("Failed to publish text to %r", chat_id)
 
@@ -100,16 +94,25 @@ async def safe_publish_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_id: 
         return
     try:
         await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=caption)
-        logger.info("Published photo to %r", chat_id)
     except Exception:
         logger.exception("Failed to publish photo to %r", chat_id)
+
+
+def fmt_game(g: dict) -> str:
+    return f"{g['title']} ({g['platform']}, {g['condition']})"
+
+
+def fmt_user(u: dict) -> str:
+    username = u.get("username") or "SinUsuario"
+    if not username.startswith("@"):
+        username = "@" + username
+    return username
 
 
 # ============================
 # MAIN COMMANDS
 # ============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start - bienvenida y registro"""
     user_id = update.effective_user.id
     user = db.get_user(user_id)
 
@@ -125,6 +128,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/search - buscar juego\n"
             f"/catalog - ver catálogo completo\n"
             f"/profile - mi perfil\n"
+            f"/swap - confirmar intercambio\n"
             f"/help - ayuda"
         )
         return ConversationHandler.END
@@ -178,6 +182,7 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/add — añadir juego para intercambio\n"
         f"/search — buscar juego\n"
         f"/catalog — ver todos los juegos disponibles\n"
+        f"/swap — confirmar intercambio\n"
         f"/help — obtener ayuda",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -374,9 +379,8 @@ async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = f"🎮 TUS JUEGOS ({len(games)}):\n\n"
     for i, game in enumerate(games, 1):
-        status_emoji = "✅" if game.get("status") == "active" else "🔄"
         message += (
-            f"{status_emoji} {i}. {game['title']}\n"
+            f"✅ {i}. {game['title']}\n"
             f"   📱 {game['platform']}  |  ⭐ {game['condition']}\n"
             f"   🔄 Busco: {game['looking_for']}\n"
             f"   📅 Añadido: {str(game['created_date'])[:10]}\n\n"
@@ -500,10 +504,265 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Comandos útiles:\n"
         "/mygames — ver mis juegos\n"
         "/add — añadir juego\n"
-        "/search — buscar juego"
+        "/search — buscar juego\n"
+        "/swap — confirmar intercambio"
     )
 
     await update.message.reply_text(message)
+
+
+# ============================
+# SWAP FLOW (Variant A)
+# ============================
+async def swap_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+    if not user:
+        await update.message.reply_text("⚠️ Primero debes registrarte → /start")
+        return ConversationHandler.END
+
+    my_games = db.get_user_games(user_id)
+    if not my_games:
+        await update.message.reply_text("📦 No tienes juegos activos. Añade uno → /add")
+        return ConversationHandler.END
+
+    keyboard = []
+    for g in my_games[:20]:
+        keyboard.append([InlineKeyboardButton(fmt_game(g), callback_data=f"swap_offer:{g['game_id']}")])
+
+    await update.message.reply_text(
+        "🔄 CONFIRMAR INTERCAMBIO\n\n"
+        "Paso 1/3 — Elige el juego que TÚ entregaste:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return SWAP_SELECT_OWN
+
+
+async def swap_select_own(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, game_id_str = query.data.split(":")
+    game_id = int(game_id_str)
+
+    g = db.get_game(game_id)
+    if not g or g["user_id"] != update.effective_user.id:
+        await query.edit_message_text("❌ Ese juego no existe o no es tuyo.")
+        return ConversationHandler.END
+
+    context.user_data["swap_offered_game_id"] = game_id
+
+    await query.edit_message_text(
+        "Paso 2/3 — Escribe el nombre del juego que recibiste (del otro usuario).\n\n"
+        "Ejemplo: Elden Ring\n\n"
+        "Puedes cancelar con /cancel"
+    )
+    return SWAP_SEARCH_OTHER
+
+
+async def swap_search_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    results = db.search_games(text)
+    results = [g for g in results if g["user_id"] != user_id]  # other users only
+
+    if not results:
+        await update.message.reply_text(
+            f"😔 No encontré «{text}» en el catálogo.\n\n"
+            "Prueba con otro nombre."
+        )
+        return SWAP_SEARCH_OTHER
+
+    results = results[:15]
+
+    keyboard = []
+    for g in results:
+        owner = db.get_user(g["user_id"])
+        keyboard.append(
+            [InlineKeyboardButton(f"{fmt_game(g)} — {fmt_user(owner)}", callback_data=f"swap_take:{g['game_id']}")]
+        )
+
+    await update.message.reply_text(
+        "Paso 3/3 — Elige el juego que recibiste:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return SWAP_SELECT_OTHER
+
+
+async def swap_select_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, game_id_str = query.data.split(":")
+    requested_game_id = int(game_id_str)
+
+    offered_game_id = context.user_data.get("swap_offered_game_id")
+    if not offered_game_id:
+        await query.edit_message_text("❌ Sesión caducada. Empieza de nuevo: /swap")
+        return ConversationHandler.END
+
+    offered = db.get_game(offered_game_id)
+    requested = db.get_game(requested_game_id)
+
+    if not offered or not requested:
+        await query.edit_message_text("❌ Juego no encontrado.")
+        return ConversationHandler.END
+
+    if offered["user_id"] != update.effective_user.id:
+        await query.edit_message_text("❌ El juego ofrecido no es tuyo.")
+        return ConversationHandler.END
+
+    if requested["user_id"] == update.effective_user.id:
+        await query.edit_message_text("❌ No puedes intercambiar contigo mismo.")
+        return ConversationHandler.END
+
+    context.user_data["swap_requested_game_id"] = requested_game_id
+
+    owner = db.get_user(requested["user_id"])
+
+    confirm_text = (
+        "🔄 CONFIRMAR INTERCAMBIO\n\n"
+        f"Tú das:  🎮 {fmt_game(offered)}\n"
+        f"Tú recibes: 🎮 {fmt_game(requested)}\n\n"
+        f"Con: {fmt_user(owner)}\n\n"
+        "¿Enviar solicitud de confirmación?"
+    )
+    keyboard = [
+        [InlineKeyboardButton("✅ Enviar solicitud", callback_data="swap_send")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="swap_cancel")],
+    ]
+    await query.edit_message_text(confirm_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return SWAP_CONFIRM
+
+
+async def swap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "swap_cancel":
+        await query.edit_message_text("❌ Intercambio cancelado.")
+        return ConversationHandler.END
+
+    offered_game_id = context.user_data.get("swap_offered_game_id")
+    requested_game_id = context.user_data.get("swap_requested_game_id")
+    if not offered_game_id or not requested_game_id:
+        await query.edit_message_text("❌ Sesión caducada. Empieza de nuevo: /swap")
+        return ConversationHandler.END
+
+    offered = db.get_game(offered_game_id)
+    requested = db.get_game(requested_game_id)
+    if not offered or not requested:
+        await query.edit_message_text("❌ Juego no encontrado.")
+        return ConversationHandler.END
+
+    initiator_id = update.effective_user.id
+    recipient_id = requested["user_id"]
+
+    created = db.create_swap_request(
+        user1_id=initiator_id,
+        user2_id=recipient_id,
+        game1_id=offered_game_id,
+        game2_id=requested_game_id,
+    )
+    if not created:
+        await query.edit_message_text("❌ No se pudo crear la solicitud. (¿Juegos cambiaron o no están activos?)")
+        return ConversationHandler.END
+
+    swap_id, code = created
+
+    initiator = db.get_user(initiator_id)
+
+    await query.edit_message_text(
+        "✅ Solicitud enviada.\n\n"
+        f"📌 Código: {code}\n"
+        "El otro usuario debe confirmarlo en el bot."
+    )
+
+    msg = (
+        "🔔 SOLICITUD DE INTERCAMBIO\n\n"
+        f"{fmt_user(initiator)} propone:\n\n"
+        f"Él/ella te da: 🎮 {fmt_game(offered)}\n"
+        f"Y quiere: 🎮 {fmt_game(requested)}\n\n"
+        f"📌 Código: {code}\n\n"
+        "¿Confirmas que el intercambio se realizó?"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Confirmar", callback_data=f"swap_accept:{swap_id}")],
+            [InlineKeyboardButton("❌ Rechazar", callback_data=f"swap_reject:{swap_id}")],
+        ]
+    )
+
+    try:
+        await context.bot.send_message(chat_id=recipient_id, text=msg, reply_markup=kb)
+    except Exception:
+        logger.exception("Failed to notify recipient about swap %s", swap_id)
+
+    return ConversationHandler.END
+
+
+async def swap_accept_or_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    action, swap_id_str = query.data.split(":")
+    swap_id = int(swap_id_str)
+
+    swap = db.get_swap(swap_id)
+    if not swap:
+        await query.edit_message_text("❌ Este intercambio ya no existe.")
+        return
+
+    user_id = update.effective_user.id
+    if user_id != swap["user2_id"]:
+        await query.edit_message_text("❌ Solo el segundo participante puede confirmar/rechazar.")
+        return
+
+    if swap.get("status") != "pending":
+        await query.edit_message_text(f"ℹ️ Este intercambio ya está en estado: {swap.get('status')}")
+        return
+
+    if action == "swap_reject":
+        db.set_swap_status(swap_id, "rejected")
+        await query.edit_message_text("❌ Has rechazado el intercambio.")
+        try:
+            await context.bot.send_message(chat_id=swap["user1_id"], text="❌ Tu solicitud de intercambio fue rechazada.")
+        except Exception:
+            logger.exception("Failed to notify initiator about rejection")
+        return
+
+    ok, err = db.complete_swap(swap_id, confirmer_user_id=user_id)
+    if not ok:
+        await query.edit_message_text(f"❌ No se pudo completar: {err}")
+        return
+
+    await query.edit_message_text("✅ Intercambio confirmado. ¡Listo!")
+
+    try:
+        await context.bot.send_message(
+            chat_id=swap["user1_id"],
+            text="✅ Tu intercambio fue confirmado. Los juegos cambiaron de dueño.",
+        )
+    except Exception:
+        logger.exception("Failed to notify initiator after swap completion")
+
+    # optional: publish
+    try:
+        g1 = db.get_game(swap["game1_id"])
+        g2 = db.get_game(swap["game2_id"])
+        u1 = db.get_user(swap["user1_id"])
+        u2 = db.get_user(swap["user2_id"])
+        await safe_publish_text(
+            context,
+            text=(
+                "🔄 Intercambio completado\n\n"
+                f"{fmt_user(u1)} ↔ {fmt_user(u2)}\n"
+                f"🎮 {g1['title']} ⇄ 🎮 {g2['title']}"
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to publish swap completion")
 
 
 # ============================
@@ -519,6 +778,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/search    — buscar juego\n"
         "/catalog   — catálogo completo\n"
         "/profile   — mi perfil\n"
+        "/swap      — confirmar intercambio\n"
         "/help      — esta ayuda\n\n"
         "❓ ¿CÓMO FUNCIONA?\n\n"
         "1. Añade el juego que quieres intercambiar (/add)\n"
@@ -526,7 +786,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Escribe al dueño por privado\n"
         "4. Quedáis en un lugar público\n"
         "5. Intercambio 1×1\n"
-        "6. Valorad el intercambio mutuamente\n\n"
+        "6. Confirmad el intercambio con /swap\n\n"
         "🛡️ SEGURIDAD:\n"
         "• Quedar siempre en sitios concurridos\n"
         "• Comprobar el disco antes de entregar\n"
@@ -600,15 +860,30 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    swap_handler = ConversationHandler(
+        entry_points=[CommandHandler("swap", swap_start)],
+        states={
+            SWAP_SELECT_OWN: [CallbackQueryHandler(swap_select_own, pattern="^swap_offer:")],
+            SWAP_SEARCH_OTHER: [MessageHandler(filters.TEXT & ~filters.COMMAND, swap_search_other)],
+            SWAP_SELECT_OTHER: [CallbackQueryHandler(swap_select_other, pattern="^swap_take:")],
+            SWAP_CONFIRM: [CallbackQueryHandler(swap_confirm, pattern="^(swap_send|swap_cancel)$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     application.add_handler(registration_handler)
     application.add_handler(add_game_handler)
     application.add_handler(search_handler)
+    application.add_handler(swap_handler)
 
     application.add_handler(CommandHandler("mygames", my_games))
     application.add_handler(CommandHandler("catalog", catalog))
     application.add_handler(CommandHandler("profile", profile))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stats", stats))
+
+    # accept/reject callbacks
+    application.add_handler(CallbackQueryHandler(swap_accept_or_reject, pattern="^(swap_accept|swap_reject):"))
 
     logger.info("🤖 Bot iniciado (polling)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
