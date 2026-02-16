@@ -85,6 +85,12 @@ CATALOG_PLATFORM, CATALOG_CITY = range(2)
 db = Database()
 
 # ----------------------------
+# Constants
+# ----------------------------
+CHANNEL_USERNAME = "@GameSwapSpain"
+CHANNEL_URL = "https://t.me/GameSwapSpain"
+
+# ----------------------------
 # Helpers
 # ----------------------------
 def env(name: str) -> Optional[str]:
@@ -319,8 +325,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     user = db.get_user(user_id)
+    
+    # 🆕 Detectar origen: ¿viene del canal?
+    args = context.args
+    source = args[0] if args else None
 
     if user:
+        # Usuario ya registrado
         await update.message.reply_text(
             f"👋 ¡Bienvenid@ de nuevo, {user['display_name']}! 🎮\n\n"
             f"📍 Tu ubicación: {user['city']}\n"
@@ -337,12 +348,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        "🎮 ¡Hola! Bienvenid@ a GameSwap Spain\n\n"
-        "Aquí puedes intercambiar juegos físicos con otros jugadores.\n\n"
-        "📝 ¡Vamos a registrarte!\n\n"
-        "¿Cómo te llamas? (o escribe tu nick)"
-    )
+    # 🆕 Usuario nuevo - mensaje personalizado según origen
+    if source == "channel":
+        # Viene del canal
+        welcome_text = (
+            f"👋 ¡Hola! Veo que vienes del canal {CHANNEL_USERNAME} 📢\n\n"
+            "Para añadir tus juegos y buscar otros, necesitas registrarte.\n"
+            "¡Solo toma 30 segundos! 🚀\n\n"
+            "📝 Empecemos con el registro:\n\n"
+            "¿Cómo te llamas? (o escribe tu nick)"
+        )
+    else:
+        # Acceso directo al bot
+        welcome_text = (
+            "🎮 ¡Hola! Bienvenid@ a GameSwap Spain\n\n"
+            "Intercambia juegos físicos directamente con otros gamers en España.\n\n"
+            "📝 ¡Vamos a registrarte!\n\n"
+            "¿Cómo te llamas? (o escribe tu nick)"
+        )
+    
+    await update.message.reply_text(welcome_text)
     return REGISTRATION_NAME
 
 
@@ -384,17 +409,26 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db.create_user(user_id, username, display_name, city)
 
+    # 🆕 Mensaje de registro completado + recomendación de canal
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📣 Suscribirme al canal",
+            url=CHANNEL_URL
+        )],
+        [InlineKeyboardButton(
+            "⏭️ Continuar usando el bot",
+            callback_data="skip_channel_sub"
+        )]
+    ])
+
     await update.message.reply_text(
         "✅ ¡Registro completado!\n\n"
         f"👤 Nombre: {display_name}\n"
         f"📍 Ciudad: {city}\n\n"
-        "Ahora puedes:\n"
-        "/add — añadir juego para intercambio\n"
-        "/search — buscar juego\n"
-        "/catalog — ver catálogo (por filtros)\n"
-        "/swap — confirmar intercambio\n"
-        "/help — obtener ayuda",
-        reply_markup=ReplyKeyboardRemove(),
+        f"📢 IMPORTANTE: Suscríbete a nuestro canal {CHANNEL_USERNAME}\n\n"
+        "Allí se publican TODOS los juegos nuevos y no te perderás nada interesante!\n\n"
+        "¿Quieres suscribirte ahora?",
+        reply_markup=keyboard
     )
 
     await safe_publish_text(
@@ -409,6 +443,27 @@ async def registration_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+# ========================================
+# CAMBIO 4: Añadir nueva función skip_channel_subscription()
+# ========================================
+
+# AÑADIR esta función DESPUÉS de registration_city():
+
+async def skip_channel_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback para cuando el usuario elige continuar sin suscribirse."""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "👍 ¡Perfecto!\n\n"
+        "Ahora puedes:\n"
+        "/add — añadir juego para intercambio\n"
+        "/search — buscar juego\n"
+        "/catalog — ver catálogo (por filtros)\n"
+        "/swap — confirmar intercambio\n"
+        "/help — obtener ayuda\n\n"
+        f"💡 Recuerda: Puedes unirte al canal {CHANNEL_USERNAME} cuando quieras para ver todos los juegos nuevos."
+    )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
@@ -576,6 +631,7 @@ async def add_game_looking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     contact_url = user_contact_url(user)
     contact_line = f"tg://user?id={int(user.get('user_id') or user_id)}" if contact_url else ""
 
+    # 🆕 Publicación mejorada con mención del bot
     message_text = (
         "🆕 ¡NUEVO JUEGO EN EL CATÁLOGO!\n\n"
         f"🎮 {html.escape(context.user_data['game_title'])}\n"
@@ -585,7 +641,8 @@ async def add_game_looking(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 Propietario: {html.escape(owner_line)}\n"
         f"📍 Ciudad: {html.escape(user.get('city',''))}\n"
         f"⭐ Valoración: {float(user.get('rating') or 0.0):.1f} ({int(user.get('total_swaps') or 0)} intercambios)\n\n"
-        + (f"💬 Contactar: {contact_line}" if contact_line else "💬 Contactar: (sin link)")
+        + (f"💬 Para contactar, usa el bot\n" if not contact_line else f"💬 Contactar: {contact_line}\n")
+        + f"\n🔍 Buscar más juegos → /catalog en el bot"
     )
 
     photo_id = context.user_data.get("game_photo")
@@ -1832,6 +1889,9 @@ def main():
     application.add_handler(CommandHandler("admin_remove_game", admin_remove_game))
     application.add_handler(CommandHandler("admin_swaps", admin_swaps))
     application.add_handler(CommandHandler("admin_stats", admin_stats))
+
+    # Handler para skip channel subscription
+    application.add_handler(CallbackQueryHandler(skip_channel_subscription, pattern="^skip_channel_sub$"))
 
     logger.info("🤖 Bot iniciado (polling)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
