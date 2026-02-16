@@ -759,8 +759,9 @@ def _catalog_platforms(games: List[dict], exclude_user_id: int) -> List[str]:
     out = []
     for g in games:
         try:
-            if int(g.get("user_id") or 0) == int(exclude_user_id):
-                continue
+            # TEMPORAL: comentado para testing
+            # if int(g.get("user_id") or 0) == int(exclude_user_id):
+            #     continue
         except Exception:
             continue
         p = (g.get("platform") or "").strip()
@@ -783,7 +784,7 @@ async def catalog_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📦 El catálogo está vacío por ahora.\n\n¡Sé el primero! → /add")
         return ConversationHandler.END
 
-    platforms = _catalog_platforms(games, exclude_user_id=user_id)
+    platforms = _catalog_platforms(games, exclude_user_id=None)  # Mostrar TODOS
     if not platforms:
         await update.message.reply_text("📦 No hay juegos de otros usuarios ahora mismo.")
         return ConversationHandler.END
@@ -834,8 +835,9 @@ async def catalog_choose_platform(update: Update, context: ContextTypes.DEFAULT_
         try:
             if (g.get("platform") or "").strip() != platform:
                 continue
-            if int(g.get("user_id") or 0) == user_id:
-                continue
+            # TEMPORAL: comentado para testing
+            # if int(g.get("user_id") or 0) == user_id:
+            #     continue
             filtered.append(g)
         except Exception:
             continue
@@ -923,8 +925,9 @@ async def catalog_choose_city(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             if (g.get("platform") or "").strip() != platform:
                 continue
-            if int(g.get("user_id") or 0) == user_id:
-                continue
+            # TEMPORAL: comentado para testing  
+            # if int(g.get("user_id") or 0) == user_id:
+            #     continue
 
             owner = db.get_user(int(g.get("user_id") or 0))
             if not owner:
